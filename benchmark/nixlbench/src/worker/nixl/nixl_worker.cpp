@@ -1541,34 +1541,38 @@ execDeviceTransfer(nixlAgent *agent,
             (gpu_level == xferBenchConfigGpuLevelThread ||
              gpu_level == xferBenchConfigGpuLevelWarp)) {
             // Use partial transfer kernel for thread/warp coordination
-            CHECK_NIXL_ERROR(launchDevicePartialKernel(&gpu_req_handle,
-                                                       num_iter,
-                                                       gpu_level.data(),
-                                                       desc_cnt,
-                                                       lengths,
-                                                       local_addrs,
-                                                       remote_addrs,
-                                                       xferBenchConfig::gdaki_threads_per_block,
-                                                       xferBenchConfig::gdaki_blocks_per_grid,
-                                                       0,
-                                                       1,
-                                                       remote_addr),
-                             "launchGdakiPartialKernel failed");
+            {
+                deviceKernelParams params{num_iter,
+                                          gpu_level,
+                                          desc_cnt,
+                                          lengths,
+                                          local_addrs,
+                                          remote_addrs,
+                                          xferBenchConfig::gdaki_threads_per_block,
+                                          xferBenchConfig::gdaki_blocks_per_grid,
+                                          0,
+                                          1,
+                                          remote_addr};
+                CHECK_NIXL_ERROR(launchDevicePartialKernel(&gpu_req_handle, params),
+                                 "launchGdakiPartialKernel failed");
+            }
         } else {
             // Use full transfer kernel (block coordination only)
-            CHECK_NIXL_ERROR(launchDeviceKernel(&gpu_req_handle,
-                                                num_iter,
-                                                gpu_level.data(),
-                                                desc_cnt,
-                                                lengths,
-                                                local_addrs,
-                                                remote_addrs,
-                                                xferBenchConfig::gdaki_threads_per_block,
-                                                xferBenchConfig::gdaki_blocks_per_grid,
-                                                0,
-                                                1,
-                                                remote_addr),
-                             "launchGdakiKernel failed");
+            {
+                deviceKernelParams params{num_iter,
+                                          gpu_level,
+                                          desc_cnt,
+                                          lengths,
+                                          local_addrs,
+                                          remote_addrs,
+                                          xferBenchConfig::gdaki_threads_per_block,
+                                          xferBenchConfig::gdaki_blocks_per_grid,
+                                          0,
+                                          1,
+                                          remote_addr};
+                CHECK_NIXL_ERROR(launchDeviceKernel(&gpu_req_handle, params),
+                                 "launchGdakiKernel failed");
+            }
         }
 
         const nixlTime::us_t post_duration = timer.lap();
