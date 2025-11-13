@@ -22,7 +22,7 @@ getRequestIndex() {
     }
 }
 
-nixl_gpu_level_t
+static inline nixl_gpu_level_t
 stringToGpuLevel(std::string_view gdaki_level) {
     if (gdaki_level == xferBenchConfigGpuLevelWarp) return nixl_gpu_level_t::WARP;
     if (gdaki_level == xferBenchConfigGpuLevelBlock) return nixl_gpu_level_t::BLOCK;
@@ -33,19 +33,14 @@ stringToGpuLevel(std::string_view gdaki_level) {
 __global__ void
 gdakiFullTransferKernel(nixlGpuXferReqH *req_handle,
                         int num_iterations,
-                        const size_t *lens,
-                        void *const *local_addrs,
-                        const uint64_t *remote_addrs,
-                        const uint64_t signal_inc,
-                        const uint64_t remote_addr) {
+                        const uint64_t signal_inc) {
     __shared__ nixlGpuXferStatusH xfer_status;
-    nixlGpuSignal signal = {signal_inc, remote_addr};
 
     // Execute transfers for the specified number of iterations
     for (int i = 0; i < num_iterations; i++) {
         // Post the GPU transfer request with signal increment of 1
-        nixl_status_t status = nixlGpuPostWriteXferReq<nixl_gpu_level_t::BLOCK>(
-            req_handle, lens, local_addrs, remote_addrs, signal, true, &xfer_status);
+        nixl_status_t status = nixlGpuPostSignalXferReq<nixl_gpu_level_t::BLOCK>(
+            req_handle, 0, signal_inc, 0, 0, true, &xfer_status);
         if (status != NIXL_SUCCESS) {
             printf("Failed to post transfer iteration %d request: %d\n", i, status);
             return; // Early exit on error
@@ -70,12 +65,8 @@ gdakiPartialTransferKernel(nixlGpuXferReqH *req_handle,
                            int num_iterations,
                            const size_t count,
                            const size_t *lens,
-                           void *const *local_addrs,
-                           const uint64_t *remote_addrs,
-                           const uint64_t signal_inc,
-                           const uint64_t remote_addr) {
-    nixlGpuXferStatusH xfer_status;
-    nixlGpuSignal signal = {signal_inc, remote_addr};
+                           const uint64_t signal_inc) {
+    __shared__ nixlGpuXferStatusH xfer_status;
 
     // Execute transfers for the specified number of iterations
     for (int i = 0; i < num_iterations; i++) {
@@ -84,10 +75,12 @@ gdakiPartialTransferKernel(nixlGpuXferReqH *req_handle,
                                                                      count,
                                                                      nullptr,
                                                                      lens,
-                                                                     local_addrs,
-                                                                     remote_addrs,
-                                                                     signal,
-                                                                     1,
+                                                                     nullptr,
+                                                                     nullptr,
+                                                                     0,
+                                                                     signal_inc,
+                                                                     0,
+                                                                     0,
                                                                      true,
                                                                      &xfer_status);
         if (status != NIXL_SUCCESS) {
@@ -106,6 +99,7 @@ gdakiPartialTransferKernel(nixlGpuXferReqH *req_handle,
         }
     }
 }
+
 
 template<nixl_gpu_level_t level>
 __global__ void
@@ -160,102 +154,32 @@ launchDeviceKernel(nixlGpuXferReqH *req_handle, const deviceKernelParams &params
         std::cout << "Falling back to block coordination for full transfers" << std::endl;
     }
 
-    // Allocate device memory for address arrays
-    void **d_local_addrs = nullptr;
-    uint64_t *d_remote_addrs = nullptr;
-    size_t *d_lens = nullptr;
+    // Allocate device memory for address arrays (RAII-managed)
+    void **d_local_addrs_raw = nullptr;
+    size_t *d_lens_raw = nullptr;
 
-    cudaError_t cuda_error = cudaMalloc(&d_local_addrs, params.count * sizeof(void *));
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to allocate device memory for local_addrs: "
-                  << cudaGetErrorString(cuda_error) << std::endl;
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_local_addrs_raw, params.count * sizeof(void *));
 
-    cuda_error = cudaMalloc(&d_remote_addrs, params.count * sizeof(uint64_t));
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to allocate device memory for remote_addrs: "
-                  << cudaGetErrorString(cuda_error) << std::endl;
-        cudaFree(d_local_addrs);
-        return NIXL_ERR_BACKEND;
-    }
+    device_ptr<void *> d_local_addrs(d_local_addrs_raw);
 
-    cuda_error = cudaMalloc(&d_lens, params.count * sizeof(size_t));
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to allocate device memory for lens: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_lens_raw, params.count * sizeof(size_t));
+
+    device_ptr<size_t> d_lens(d_lens_raw);
 
     // Copy host arrays to device
-    cuda_error = cudaMemcpy(
-        d_local_addrs, params.local_addrs, params.count * sizeof(void *), cudaMemcpyHostToDevice);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to copy local_addrs to device: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_local_addrs.get(), params.local_addrs, params.count * sizeof(void *), cudaMemcpyHostToDevice);
 
-    cuda_error = cudaMemcpy(d_remote_addrs,
-                            params.remote_addrs,
-                            params.count * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to copy remote_addrs to device: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_lens.get(), params.lens, params.count * sizeof(size_t), cudaMemcpyHostToDevice);
 
-    cuda_error =
-        cudaMemcpy(d_lens, params.lens, params.count * sizeof(size_t), cudaMemcpyHostToDevice);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to copy lens to device: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
-
-    gdakiFullTransferKernel<<<params.blocks_per_grid, params.threads_per_block, 0, params.stream>>>(
-        req_handle,
-        params.num_iterations,
-        d_lens,
-        d_local_addrs,
-        d_remote_addrs,
-        params.signal_inc,
-        params.remote_addr);
-
+    gdakiFullTransferKernel
+        <<<1, params.threads_per_block>>>(req_handle,
+                                          params.num_iterations,
+                                          params.signal_inc);
     // Check for launch errors
-    cudaError_t launch_error = cudaGetLastError();
-    if (launch_error != cudaSuccess) {
-        std::cerr << "Failed to launch device full transfer kernel: "
-                  << cudaGetErrorString(launch_error) << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaGetLastError);
 
     // Wait for kernel completion before freeing device memory
-    cuda_error = cudaStreamSynchronize(params.stream);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to synchronize stream: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-    }
-
-    // Free device memory
-    cudaFree(d_local_addrs);
-    cudaFree(d_remote_addrs);
-    cudaFree(d_lens);
+    CUDA_CALL(/*no-op*/, UCS_LOG_LEVEL_ERROR, cudaStreamSynchronize, params.stream);
 
     return NIXL_SUCCESS;
 }
@@ -272,125 +196,49 @@ launchDevicePartialKernel(nixlGpuXferReqH *req_handle, const deviceKernelParams 
         return ret;
     }
 
-    // Allocate device memory for address arrays
-    void **d_local_addrs = nullptr;
-    uint64_t *d_remote_addrs = nullptr;
-    size_t *d_lens = nullptr;
+    // Allocate device memory for address arrays (RAII-managed)
+    void **d_local_addrs_raw = nullptr;
+    size_t *d_lens_raw = nullptr;
 
-    cudaError_t cuda_error = cudaMalloc(&d_local_addrs, params.count * sizeof(void *));
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to allocate device memory for local_addrs: "
-                  << cudaGetErrorString(cuda_error) << std::endl;
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_local_addrs_raw, params.count * sizeof(void *));
 
-    cuda_error = cudaMalloc(&d_remote_addrs, params.count * sizeof(uint64_t));
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to allocate device memory for remote_addrs: "
-                  << cudaGetErrorString(cuda_error) << std::endl;
-        cudaFree(d_local_addrs);
-        return NIXL_ERR_BACKEND;
-    }
+    device_ptr<void *> d_local_addrs(d_local_addrs_raw);
 
-    cuda_error = cudaMalloc(&d_lens, params.count * sizeof(size_t));
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to allocate device memory for lens: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_lens_raw, params.count * sizeof(size_t));
+
+    device_ptr<size_t> d_lens(d_lens_raw);
 
     // Copy host arrays to device
-    cuda_error = cudaMemcpy(
-        d_local_addrs, params.local_addrs, params.count * sizeof(void *), cudaMemcpyHostToDevice);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to copy local_addrs to device: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_local_addrs.get(), params.local_addrs, params.count * sizeof(void *), cudaMemcpyHostToDevice);
 
-    cuda_error = cudaMemcpy(d_remote_addrs,
-                            params.remote_addrs,
-                            params.count * sizeof(uint64_t),
-                            cudaMemcpyHostToDevice);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to copy remote_addrs to device: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
-
-    cuda_error =
-        cudaMemcpy(d_lens, params.lens, params.count * sizeof(size_t), cudaMemcpyHostToDevice);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to copy lens to device: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_lens.get(), params.lens, params.count * sizeof(size_t), cudaMemcpyHostToDevice);
 
     // Launch partial transfer kernel based on coordination level
     if (gpulevel == nixl_gpu_level_t::THREAD) {
         gdakiPartialTransferKernel<nixl_gpu_level_t::THREAD>
-            <<<params.blocks_per_grid, params.threads_per_block, 0, params.stream>>>(
-                req_handle,
-                params.num_iterations,
-                params.count,
-                d_lens,
-                d_local_addrs,
-                d_remote_addrs,
-                params.signal_inc,
-                params.remote_addr);
+            <<<1, params.threads_per_block>>>(req_handle,
+                                              params.num_iterations,
+                                              params.count,
+                                              d_lens.get(),
+                                              params.signal_inc);
     } else if (gpulevel == nixl_gpu_level_t::WARP) {
         gdakiPartialTransferKernel<nixl_gpu_level_t::WARP>
-            <<<params.blocks_per_grid, params.threads_per_block, 0, params.stream>>>(
-                req_handle,
-                params.num_iterations,
-                params.count,
-                d_lens,
-                d_local_addrs,
-                d_remote_addrs,
-                params.signal_inc,
-                params.remote_addr);
+            <<<1, params.threads_per_block>>>(req_handle,
+                                              params.num_iterations,
+                                              params.count,
+                                              d_lens.get(),
+                                              params.signal_inc);
     } else {
         std::cerr << "Invalid GPU level selected for partial transfers: " << params.level
                   << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
         return NIXL_ERR_INVALID_PARAM;
     }
 
     // Check for launch errors
-    cudaError_t launch_error = cudaGetLastError();
-    if (launch_error != cudaSuccess) {
-        std::cerr << "Failed to launch device partial transfer kernel: "
-                  << cudaGetErrorString(launch_error) << std::endl;
-        cudaFree(d_local_addrs);
-        cudaFree(d_remote_addrs);
-        cudaFree(d_lens);
-        return NIXL_ERR_BACKEND;
-    }
+    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaGetLastError);
 
     // Wait for kernel completion before freeing device memory
-    cuda_error = cudaStreamSynchronize(params.stream);
-    if (cuda_error != cudaSuccess) {
-        std::cerr << "Failed to synchronize stream: " << cudaGetErrorString(cuda_error)
-                  << std::endl;
-    }
-
-    // Free device memory
-    cudaFree(d_local_addrs);
-    cudaFree(d_remote_addrs);
-    cudaFree(d_lens);
+    CUDA_CALL(/*no-op*/, UCS_LOG_LEVEL_ERROR, cudaStreamSynchronize, params.stream);
 
     return NIXL_SUCCESS;
 }

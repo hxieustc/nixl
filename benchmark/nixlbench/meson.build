@@ -155,6 +155,8 @@ if cuda_fabric_available
     add_project_arguments('-DHAVE_CUDA_FABRIC', language: 'cpp')
 endif
 
+doca_gpunetio_dep = dependency('doca-gpunetio', required : false)
+
 have_nixl_gdaki = false
 ucxpath_inc = get_option('ucxpath_inc')
 if ucxpath_inc != ''
@@ -165,7 +167,7 @@ if ucxpath_inc != ''
 
         if nvcc.compiles(test_code,
                         include_directories: include_directories(nixl_inc, ucxpath_inc),
-                        dependencies: [cuda_dep],
+                        dependencies: [cuda_dep, doca_gpunetio_dep],
                         args: nvcc_flags_link)
             have_nixl_gdaki = true
             add_project_arguments('-DHAVE_NIXL_DEV_API', language: ['cpp', 'cuda'])

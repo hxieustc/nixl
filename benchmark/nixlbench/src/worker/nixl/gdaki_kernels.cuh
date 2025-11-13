@@ -8,10 +8,39 @@
 
 #include <iostream>
 #include <string_view>
+#include <memory>
 #include "utils/utils.h"
 #include <nixl_types.h>
 
 #define MAX_THREADS 1024
+
+#ifndef CUDA_CALL
+#define CUDA_CALL(_handler, _log_level, _func, ...)                           \
+    do {                                                                      \
+        cudaError_t _cerr = _func(__VA_ARGS__);                               \
+        if (_cerr != cudaSuccess) {                                           \
+	    std::cout << #_func << " failed: " << (int)_cerr << " : "             \
+	              << cudaGetErrorString(_cerr) << std::endl;                  \
+            _handler;                                                         \
+        }                                                                     \
+    } while (0)
+#endif
+
+nixl_status_t
+checkDeviceKernelParams(nixlGpuXferReqH *req_handle,
+                        int num_iterations,
+                        int threads_per_block,
+                        int blocks_per_grid);
+
+// RAII helpers for CUDA device allocations
+struct device_free {
+    void operator()(void *p) const noexcept {
+        if (p) cudaFree(p);
+    }
+};
+
+template<class T>
+using device_ptr = std::unique_ptr<T, device_free>;
 
 nixl_status_t
 checkDeviceKernelParams(nixlGpuXferReqH *req_handle,
@@ -27,11 +56,10 @@ struct deviceKernelParams {
     const size_t *lens;
     void *const *local_addrs;
     const uint64_t *remote_addrs;
-    int threads_per_block = 256;
-    int blocks_per_grid = 1;
+    size_t threads_per_block = 256;
+    size_t blocks_per_grid = 1;
     cudaStream_t stream = 0;
     uint64_t signal_inc = 0;
-    uint64_t remote_addr = 0;
 };
 
 // Launch Device kernel for device-side transfer execution (full transfers)

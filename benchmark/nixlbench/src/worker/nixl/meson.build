@@ -40,8 +40,19 @@ if cuda_available and have_nixl_gdaki
         '-o', '@OUTPUT@',
         '-I' + nixl_inc,
         '-I' + meson.current_source_dir() + '/../../..',
-        '-I' + nixl_path + '/src',
-        '-I' + nixl_path + '/src/utils',
+        '-I' + meson.current_source_dir() + '/../..',
+        '-I' + nixl_path + '/include',
+      ]
+
+      # Add UCX include path if ucxpath_inc option is provided
+      ucxpath_inc = get_option('ucxpath_inc')
+      if ucxpath_inc != ''
+          nvcc_args += [
+            '-I' + ucxpath_inc,
+            '-I' + '/opt/mellanox/doca/include']
+      endif
+
+      nvcc_args += [
         '--std=c++17',
         '-arch=sm_80',
         '--ptxas-options=-v',
@@ -50,11 +61,6 @@ if cuda_available and have_nixl_gdaki
         '-DHAVE_CUDA'
       ]
 
-      # Add UCX include path if ucxpath_inc option is provided
-      ucxpath_inc = get_option('ucxpath_inc')
-      if ucxpath_inc != ''
-        nvcc_args += ['-I' + ucxpath_inc]
-      endif
 
       # Compile CUDA kernels
       nixl_cuda_obj = custom_target('nixl_gdaki_kernels_obj',
