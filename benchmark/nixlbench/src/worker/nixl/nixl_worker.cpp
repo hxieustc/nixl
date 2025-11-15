@@ -354,7 +354,6 @@ xferBenchNixlWorker::cleanupSignalBuffer(std::optional<xferBenchIOV> &signal_des
 
 #define NOTIF_WIREUP_COMP "wireup_complete"
 
-
 bool
 xferBenchNixlWorker::sendWireupNotification(std::string_view &remote_name) {
     nixl_status_t notif_status;
@@ -367,8 +366,8 @@ xferBenchNixlWorker::sendWireupNotification(std::string_view &remote_name) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    std::cerr << "Failed to send wireup completion notification after retries to "
-              << remote_name << ", error: " << nixlEnumStrings::statusStr(notif_status) << std::endl;
+    std::cerr << "Failed to send wireup completion notification after retries to " << remote_name
+              << ", error: " << nixlEnumStrings::statusStr(notif_status) << std::endl;
     return false;
 };
 

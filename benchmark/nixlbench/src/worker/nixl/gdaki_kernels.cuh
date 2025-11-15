@@ -15,14 +15,14 @@
 #define MAX_THREADS 1024
 
 #ifndef CUDA_CALL
-#define CUDA_CALL(_handler, _log_level, _func, ...)                           \
-    do {                                                                      \
-        cudaError_t _cerr = _func(__VA_ARGS__);                               \
-        if (_cerr != cudaSuccess) {                                           \
-	    std::cout << #_func << " failed: " << (int)_cerr << " : "             \
-	              << cudaGetErrorString(_cerr) << std::endl;                  \
-            _handler;                                                         \
-        }                                                                     \
+#define CUDA_CALL(_handler, _log_level, _func, ...)                                                \
+    do {                                                                                           \
+        cudaError_t _cerr = _func(__VA_ARGS__);                                                    \
+        if (_cerr != cudaSuccess) {                                                                \
+            std::cout << #_func << " failed: " << (int)_cerr << " : " << cudaGetErrorString(_cerr) \
+                      << std::endl;                                                                \
+            _handler;                                                                              \
+        }                                                                                          \
     } while (0)
 #endif
 
@@ -34,13 +34,13 @@ checkDeviceKernelParams(nixlGpuXferReqH *req_handle,
 
 // RAII helpers for CUDA device allocations
 struct device_free {
-    void operator()(void *p) const noexcept {
+    void
+    operator()(void *p) const noexcept {
         if (p) cudaFree(p);
     }
 };
 
-template<class T>
-using device_ptr = std::unique_ptr<T, device_free>;
+template<class T> using device_ptr = std::unique_ptr<T, device_free>;
 
 nixl_status_t
 checkDeviceKernelParams(nixlGpuXferReqH *req_handle,

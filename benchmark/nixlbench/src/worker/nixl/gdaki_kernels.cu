@@ -125,7 +125,8 @@ checkDeviceKernelParams(nixlGpuXferReqH *req_handle,
     }
 
     if (threads_per_block < 1 || threads_per_block > MAX_THREADS) {
-        std::cerr << "Invalid threads per block, must be between 1 and " << MAX_THREADS << std::endl;
+        std::cerr << "Invalid threads per block, must be between 1 and " << MAX_THREADS
+                  << std::endl;
         return NIXL_ERR_INVALID_PARAM;
     }
 
@@ -158,23 +159,41 @@ launchDeviceKernel(nixlGpuXferReqH *req_handle, const deviceKernelParams &params
     void **d_local_addrs_raw = nullptr;
     size_t *d_lens_raw = nullptr;
 
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_local_addrs_raw, params.count * sizeof(void *));
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMalloc,
+                     &d_local_addrs_raw,
+                     params.count * sizeof(void *));
 
     device_ptr<void *> d_local_addrs(d_local_addrs_raw);
 
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_lens_raw, params.count * sizeof(size_t));
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMalloc,
+                     &d_lens_raw,
+                     params.count * sizeof(size_t));
 
     device_ptr<size_t> d_lens(d_lens_raw);
 
     // Copy host arrays to device
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_local_addrs.get(), params.local_addrs, params.count * sizeof(void *), cudaMemcpyHostToDevice);
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMemcpy,
+                     d_local_addrs.get(),
+                     params.local_addrs,
+                     params.count * sizeof(void *),
+                     cudaMemcpyHostToDevice);
 
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_lens.get(), params.lens, params.count * sizeof(size_t), cudaMemcpyHostToDevice);
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMemcpy,
+                     d_lens.get(),
+                     params.lens,
+                     params.count * sizeof(size_t),
+                     cudaMemcpyHostToDevice);
 
-    gdakiFullTransferKernel
-        <<<1, params.threads_per_block>>>(req_handle,
-                                          params.num_iterations,
-                                          params.signal_inc);
+    gdakiFullTransferKernel<<<1, params.threads_per_block>>>(
+        req_handle, params.num_iterations, params.signal_inc);
     // Check for launch errors
     CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaGetLastError);
 
@@ -200,34 +219,46 @@ launchDevicePartialKernel(nixlGpuXferReqH *req_handle, const deviceKernelParams 
     void **d_local_addrs_raw = nullptr;
     size_t *d_lens_raw = nullptr;
 
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_local_addrs_raw, params.count * sizeof(void *));
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMalloc,
+                     &d_local_addrs_raw,
+                     params.count * sizeof(void *));
 
     device_ptr<void *> d_local_addrs(d_local_addrs_raw);
 
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMalloc, &d_lens_raw, params.count * sizeof(size_t));
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMalloc,
+                     &d_lens_raw,
+                     params.count * sizeof(size_t));
 
     device_ptr<size_t> d_lens(d_lens_raw);
 
     // Copy host arrays to device
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_local_addrs.get(), params.local_addrs, params.count * sizeof(void *), cudaMemcpyHostToDevice);
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMemcpy,
+                     d_local_addrs.get(),
+                     params.local_addrs,
+                     params.count * sizeof(void *),
+                     cudaMemcpyHostToDevice);
 
-    CUDA_CALL(return NIXL_ERR_BACKEND, UCS_LOG_LEVEL_ERROR, cudaMemcpy, d_lens.get(), params.lens, params.count * sizeof(size_t), cudaMemcpyHostToDevice);
+    CUDA_CALL(return NIXL_ERR_BACKEND,
+                     UCS_LOG_LEVEL_ERROR,
+                     cudaMemcpy,
+                     d_lens.get(),
+                     params.lens,
+                     params.count * sizeof(size_t),
+                     cudaMemcpyHostToDevice);
 
     // Launch partial transfer kernel based on coordination level
     if (gpulevel == nixl_gpu_level_t::THREAD) {
-        gdakiPartialTransferKernel<nixl_gpu_level_t::THREAD>
-            <<<1, params.threads_per_block>>>(req_handle,
-                                              params.num_iterations,
-                                              params.count,
-                                              d_lens.get(),
-                                              params.signal_inc);
+        gdakiPartialTransferKernel<nixl_gpu_level_t::THREAD><<<1, params.threads_per_block>>>(
+            req_handle, params.num_iterations, params.count, d_lens.get(), params.signal_inc);
     } else if (gpulevel == nixl_gpu_level_t::WARP) {
-        gdakiPartialTransferKernel<nixl_gpu_level_t::WARP>
-            <<<1, params.threads_per_block>>>(req_handle,
-                                              params.num_iterations,
-                                              params.count,
-                                              d_lens.get(),
-                                              params.signal_inc);
+        gdakiPartialTransferKernel<nixl_gpu_level_t::WARP><<<1, params.threads_per_block>>>(
+            req_handle, params.num_iterations, params.count, d_lens.get(), params.signal_inc);
     } else {
         std::cerr << "Invalid GPU level selected for partial transfers: " << params.level
                   << std::endl;
