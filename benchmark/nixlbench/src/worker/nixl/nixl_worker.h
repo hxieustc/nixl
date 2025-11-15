@@ -66,17 +66,19 @@ class xferBenchNixlWorker: public xferBenchWorker {
         void
         poll(size_t block_size) override;
         void
-        device_poll(size_t block_size, unsigned int skip, unsigned int num_iter);
+        devicePoll(size_t block_size, unsigned int skip, unsigned int num_iter);
         int
         synchronizeStart();
-        int
-        send_wireup_notification(const std::string &remote_name);
-        int
-        wait_for_ack(const std::string &remote_name);
+        bool
+        sendWireupNotification(std::string_view &remote_name);
+        bool
+        waitForAck(std::string_view &remote_name);
         void
-        send_metadata(std::string local_md, int rank);
-        int
-        recv_and_load_metadata(int rank);
+        sendMetadata(std::string_view local_md, int rank);
+        bool
+        recvAndLoadMetadata(int rank);
+        bool
+        waitForWireupAck(std::string_view item);
 
         // Data operations
         std::variant<xferBenchStats, int>
@@ -100,11 +102,11 @@ class xferBenchNixlWorker: public xferBenchWorker {
         cleanupSignalBuffer(std::optional<xferBenchIOV> &);
 
         // GDAKI wireup notification
-        int
+        bool
         sendWireupMessage();
 
         // GDAKI bidirectional metadata exchange
-        int
+        bool
         exchangeMetadataBidirectional();
         std::optional<xferBenchIOV>
         initBasicDescFile(size_t buffer_size, xferFileState &fstate, int mem_dev_id);

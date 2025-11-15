@@ -354,102 +354,99 @@ xferBenchNixlWorker::cleanupSignalBuffer(std::optional<xferBenchIOV> &signal_des
 
 #define NOTIF_WIREUP_COMP "wireup_complete"
 
-int
-xferBenchNixlWorker::send_wireup_notification(const std::string &remote_name) {
-    int retry_count = 0;
-    const int max_retries = 10;
+
+bool
+xferBenchNixlWorker::sendWireupNotification(std::string_view &remote_name) {
     nixl_status_t notif_status;
     nixl_opt_args_t extra_params = {};
     extra_params.backends.push_back(backend_engine);
-    do {
-        notif_status = agent->genNotif(remote_name, NOTIF_WIREUP_COMP, &extra_params);
-        if (notif_status != NIXL_SUCCESS && retry_count < max_retries) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            retry_count++;
+    for (int retry_count = 0; retry_count < 10; retry_count++) {
+        notif_status = agent->genNotif(std::string(remote_name), NOTIF_WIREUP_COMP, &extra_params);
+        if (notif_status == NIXL_SUCCESS) {
+            return true;
         }
-    } while (notif_status != NIXL_SUCCESS && retry_count < max_retries);
-
-    if (notif_status != NIXL_SUCCESS) {
-        std::cerr << "Failed to send wireup completion notification after retries" << std::endl;
-        return -1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    return 0;
+    std::cerr << "Failed to send wireup completion notification after retries to "
+              << remote_name << ", error: " << nixlEnumStrings::statusStr(notif_status) << std::endl;
+    return false;
 };
 
-int
-xferBenchNixlWorker::wait_for_ack(const std::string &remote_name) {
-    bool ack_received = false;
-    const int max_ack_attempts = 50;
+bool
+xferBenchNixlWorker::waitForWireupAck(std::string_view item) {
     nixl_opt_args_t extra_params = {};
     extra_params.backends.push_back(backend_engine);
 
-    for (int attempt = 0; attempt < max_ack_attempts && !ack_received; attempt++) {
-        nixl_notifs_t notifs;
-        nixl_status_t get_status = agent->getNotifs(notifs, &extra_params);
-        if (get_status >= 0 && !notifs.empty()) {
-            auto it = notifs.find(remote_name);
-            if (it != notifs.end()) {
-                for (const auto &notif : it->second) {
-                    if (notif == NOTIF_WIREUP_COMP) {
-                        ack_received = true;
-                        return 0;
-                    }
+    nixl_notifs_t notifs;
+    nixl_status_t get_status = agent->getNotifs(notifs, &extra_params);
+    if (get_status == NIXL_SUCCESS && !notifs.empty()) {
+        auto it = notifs.find(std::string(item));
+        if (it != notifs.end()) {
+            for (const auto &notif : it->second) {
+                if (notif == std::string(item)) {
+                    return true;
                 }
             }
         }
-        if (!ack_received) {
+    }
+    return false;
+}
+
+bool
+xferBenchNixlWorker::waitForAck(std::string_view &remote_name) {
+    bool ack_received = false;
+
+    for (int attempt = 0; attempt < 50 && !ack_received; attempt++) {
+        if (!waitForWireupAck(std::string_view(NOTIF_WIREUP_COMP))) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } else {
+            return true;
         }
     }
-    if (!ack_received) {
-        std::cerr << "Timeout waiting for wireup acknowledgment from " << remote_name << std::endl;
-        return -1;
-    }
-    return 0;
+    std::cerr << "Timeout waiting for wireup acknowledgment from " << remote_name << std::endl;
+    return false;
 };
 
-int
+bool
 xferBenchNixlWorker::sendWireupMessage() {
     if (!is_gdaki_enabled) {
-        return 0;
+        return true;
     }
 
-    std::string remote_name;
+    std::string_view remote_name;
     if (isInitiator()) {
         remote_name = "target";
-        if (send_wireup_notification(remote_name) != 0) {
-            return -1;
+        if (!sendWireupNotification(remote_name)) {
+            return false;
         }
-        if (wait_for_ack(remote_name) != 0) {
-            return -1;
+        if (!waitForAck(remote_name)) {
+            return false;
         }
     } else if (isTarget()) {
         remote_name = "initiator";
-        if (wait_for_ack(remote_name) != 0) {
-            return -1;
+        if (!waitForAck(remote_name)) {
+            return false;
         }
-        if (send_wireup_notification(remote_name) != 0) {
-            return -1;
+        if (!sendWireupNotification(remote_name)) {
+            return false;
         }
     } else {
         std::cerr << "Unknown role for wireup message" << std::endl;
-        return -1;
+        return false;
     }
 
-    return 0;
+    return true;
 }
 
 void
-xferBenchNixlWorker::send_metadata(const std::string local_md, int rank) {
-    const char *send_buffer = local_md.data();
+xferBenchNixlWorker::sendMetadata(std::string_view local_md, int rank) {
     int meta_sz = local_md.size();
-
     rt->sendInt(&meta_sz, rank);
-    rt->sendChar((char *)send_buffer, meta_sz, rank);
+    rt->sendChar(const_cast<char *>(local_md.data()), meta_sz, rank);
 };
 
-int
-xferBenchNixlWorker::recv_and_load_metadata(int rank) {
+bool
+xferBenchNixlWorker::recvAndLoadMetadata(int rank) {
     int recv_meta_sz;
     rt->recvInt(&recv_meta_sz, rank);
 
@@ -461,13 +458,11 @@ xferBenchNixlWorker::recv_and_load_metadata(int rank) {
     std::string remote_agent;
     agent->loadRemoteMD(remote_metadata, remote_agent);
 
-    return remote_agent.empty() ? -1 : 0;
+    return remote_agent.empty() ? false : true;
 };
 
-int
+bool
 xferBenchNixlWorker::exchangeMetadataBidirectional() {
-    int ret = 0;
-
     // Get local metadata to send
     std::string local_metadata;
     agent->getLocalMD(local_metadata);
@@ -483,17 +478,17 @@ xferBenchNixlWorker::exchangeMetadataBidirectional() {
 
     // Phase 1: Target sends, Initiator receives
     if (isTarget()) {
-        send_metadata(local_metadata, peer_rank);
-        ret = recv_and_load_metadata(peer_rank);
-    } else { // isInitiator
-        ret = recv_and_load_metadata(peer_rank);
-
-        if (!ret) {
-            send_metadata(local_metadata, peer_rank);
+        sendMetadata(local_metadata, peer_rank);
+        if (!recvAndLoadMetadata(peer_rank)) {
+            return false;
         }
+    } else { // isInitiator
+        if (!recvAndLoadMetadata(peer_rank)) {
+            return false;
+        }
+        sendMetadata(local_metadata, peer_rank);
     }
-
-    return ret;
+    return true;
 }
 
 enum class AllocationType { POSIX_MEMALIGN, CALLOC, MALLOC };
@@ -1166,7 +1161,9 @@ xferBenchNixlWorker::exchangeMetadata() {
 
     // Use bidirectional metadata exchange for GDAKI mode
     if (is_gdaki_enabled) {
-        ret = exchangeMetadataBidirectional();
+        if (!exchangeMetadataBidirectional()) {
+            return -1;
+        }
     } else {
         // Standard unidirectional metadata exchange for non-GDAKI mode
         if (isTarget()) {
@@ -1310,8 +1307,7 @@ xferBenchNixlWorker::exchangeIOV(const std::vector<std::vector<xferBenchIOV>> &l
     // Ensure all processes have completed the exchange with a barrier/sync
     synchronize();
     if (is_gdaki_enabled) {
-        int ret = sendWireupMessage();
-        if (ret < 0) {
+        if (!sendWireupMessage()) {
             std::cerr << "Wireup failed, aborting transfer" << std::endl;
             return std::vector<std::vector<xferBenchIOV>>();
         }
@@ -1724,7 +1720,7 @@ xferBenchNixlWorker::transfer(size_t block_size,
 
 #if HAVE_NIXL_DEV_API
 void
-xferBenchNixlWorker::device_poll(size_t block_size, unsigned int skip, unsigned int num_iter) {
+xferBenchNixlWorker::devicePoll(size_t block_size, unsigned int skip, unsigned int num_iter) {
     std::string_view gpu_level = *(xferBenchConfigGpuLevels.find(xferBenchConfig::gdaki_gpu_level));
     unsigned int total_iter = skip + num_iter;
 
@@ -1773,7 +1769,7 @@ xferBenchNixlWorker::poll(size_t block_size) {
 
     if (is_gdaki_enabled) {
 #if HAVE_NIXL_DEV_API
-        device_poll(block_size, skip, num_iter);
+        devicePoll(block_size, skip, num_iter);
 #else
         std::cerr << "Trying to run device API without supported header" << std::endl;
 #endif
