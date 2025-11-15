@@ -97,7 +97,7 @@ DEFINE_int32(gdaki_threads_per_block,
              256,
              "Number of CUDA threads per block for GDAKI kernels (default: 256, range: 1-1024)");
 //"Number of CUDA threads per block for GDAKI kernels (default: 256, range: 1-" +
-//std::to_string(XFERBENCH_DEV_API_MAX_THREADS) + ")");
+// std::to_string(XFERBENCH_DEV_API_MAX_THREADS) + ")");
 DEFINE_int32(gdaki_blocks_per_grid,
              1,
              "Number of CUDA blocks to launch for concurrent transfers (default: 1)");
