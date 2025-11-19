@@ -127,6 +127,23 @@ fn create_posix_backend(agent: &Agent) -> Option<(Backend, OptArgs)> {
 }
 
 #[test]
+fn create_agent_with_custom_config() {
+    // Ensure we can construct with non-default config
+    let cfg = AgentConfig {
+        enable_listen_thread: true,
+        listen_port: 0,
+        capture_telemetry: false,
+        ..Default::default()
+    };
+
+    let agent = Agent::new_configured("cfg_agent", &cfg)
+        .expect("Failed to create configured agent");
+
+    // basic sanity: can query available plugins
+    let _plugins = agent.get_available_plugins().expect("Failed to get plugins");
+}
+
+#[test]
 fn test_agent_creation() {
     let agent = Agent::new("test_agent").expect("Failed to create agent");
     drop(agent);
@@ -1350,4 +1367,353 @@ fn test_query_xfer_backend_invalid_request() {
         );
         assert!(xfer_req_result.is_err(), "Transfer request creation should fail for non-existent agent");
  }
+}
+
+// Tests for get_xfer_telemetry API
+#[test]
+fn test_get_xfer_telemetry_success() {
+    env::set_var("NIXL_TELEMETRY_ENABLE", "1");
+
+    let (agent1, opt_args) = create_agent_with_backend("agent1").expect("Failed to create agent");
+    let (agent2, opt_args_remote) = create_agent_with_backend("agent2").expect("Failed to create agent");
+
+    let mut storage_list = create_storage_list(&agent1, &opt_args, 1);
+    let mut remote_storage_list = create_storage_list(&agent2, &opt_args_remote, 1);
+
+    {
+        let local_dlist = create_dlist(&mut storage_list).expect("Failed to create descriptor list");
+        let remote_dlist = create_dlist(&mut remote_storage_list).expect("Failed to create descriptor list");
+
+        exchange_metadata(&agent1, &agent2).expect("Failed to exchange metadata");
+
+        let xfer_req = agent1.create_xfer_req(
+            XferOp::Write,
+            &local_dlist,
+            &remote_dlist,
+            "agent2",
+            None
+        ).expect("Failed to create transfer request");
+
+        let result = agent1.post_xfer_req(&xfer_req, Some(&opt_args));
+        assert!(result.is_ok(), "post_xfer_req failed with error: {:?}", result.err());
+
+        // Wait for transfer to complete
+        loop {
+            match agent1.get_xfer_status(&xfer_req) {
+                Ok(XferStatus::Success) => break,
+                Ok(XferStatus::InProgress) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => panic!("Failed to get transfer status: {:?}", e),
+            }
+        }
+
+        let telemetry_result = xfer_req.get_telemetry();
+        assert!(telemetry_result.is_ok(), "get_xfer_telemetry failed with error: {:?}", telemetry_result.err());
+
+        let telemetry = telemetry_result.unwrap();
+        assert!(telemetry.start_time_us > 0, "Start time should be greater than 0");
+        assert!(telemetry.total_bytes > 0, "Total bytes should be greater than 0");
+        assert!(telemetry.desc_count > 0, "Descriptor count should be greater than 0");
+
+        // Test convenience methods
+        let start_time = telemetry.start_time();
+        assert!(start_time.as_micros() == telemetry.start_time_us as u128);
+
+        let post_duration = telemetry.post_duration();
+        assert!(post_duration.as_micros() == telemetry.post_duration_us as u128);
+
+        let xfer_duration = telemetry.xfer_duration();
+        assert!(xfer_duration.as_micros() == telemetry.xfer_duration_us as u128);
+
+        let total_duration = telemetry.total_duration();
+        assert!(total_duration.as_micros() == (telemetry.post_duration_us + telemetry.xfer_duration_us) as u128);
+
+        // Test transfer rate calculation
+        let rate = telemetry.transfer_rate_bps();
+        if telemetry.xfer_duration_us > 0 {
+            assert!(rate > 0.0, "Transfer rate should be positive when transfer duration > 0");
+        }
+
+        println!("Telemetry data: {:?}", telemetry);
+        println!("Transfer rate: {:.2} MB/s", rate / 1_000_000.0);
+    }
+}
+
+#[test]
+fn test_get_xfer_telemetry_from_request() {
+    env::set_var("NIXL_TELEMETRY_ENABLE", "1");
+
+    let (agent1, opt_args) = create_agent_with_backend("agent1").expect("Failed to create agent");
+    let (agent2, opt_args_remote) = create_agent_with_backend("agent2").expect("Failed to create agent");
+
+    let mut storage_list = create_storage_list(&agent1, &opt_args, 1);
+    let mut remote_storage_list = create_storage_list(&agent2, &opt_args_remote, 1);
+
+    {
+        let local_dlist = create_dlist(&mut storage_list).expect("Failed to create descriptor list");
+        let remote_dlist = create_dlist(&mut remote_storage_list).expect("Failed to create descriptor list");
+
+        exchange_metadata(&agent1, &agent2).expect("Failed to exchange metadata");
+
+        let xfer_req = agent1.create_xfer_req(
+            XferOp::Write,
+            &local_dlist,
+            &remote_dlist,
+            "agent2",
+            None
+        ).expect("Failed to create transfer request");
+
+        let result = agent1.post_xfer_req(&xfer_req, Some(&opt_args));
+        assert!(result.is_ok(), "post_xfer_req failed with error: {:?}", result.err());
+
+        // Wait for transfer to complete
+        loop {
+            match agent1.get_xfer_status(&xfer_req) {
+                Ok(XferStatus::Success) => break,
+                Ok(XferStatus::InProgress) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => panic!("Failed to get transfer status: {:?}", e),
+            }
+        }
+
+        let telemetry_result = xfer_req.get_telemetry();
+        assert!(telemetry_result.is_ok(), "get_telemetry from request failed with error: {:?}", telemetry_result.err());
+
+        let telemetry = telemetry_result.unwrap();
+        assert!(telemetry.start_time_us > 0, "Start time should be greater than 0");
+        assert!(telemetry.total_bytes > 0, "Total bytes should be greater than 0");
+        assert!(telemetry.desc_count > 0, "Descriptor count should be greater than 0");
+
+        println!("Telemetry data from request: {:?}", telemetry);
+    }
+}
+
+#[test]
+fn test_get_xfer_telemetry_without_telemetry_enabled() {
+    env::remove_var("NIXL_TELEMETRY_ENABLE");
+
+    let (agent1, opt_args) = create_agent_with_backend("agent1").expect("Failed to create agent");
+    let (agent2, opt_args_remote) = create_agent_with_backend("agent2").expect("Failed to create agent");
+
+    // Create descriptor lists
+    let mut storage_list = create_storage_list(&agent1, &opt_args, 1);
+    let mut remote_storage_list = create_storage_list(&agent2, &opt_args_remote, 1);
+
+    {
+        let local_dlist = create_dlist(&mut storage_list).expect("Failed to create descriptor list");
+        let remote_dlist = create_dlist(&mut remote_storage_list).expect("Failed to create descriptor list");
+
+        exchange_metadata(&agent1, &agent2).expect("Failed to exchange metadata");
+
+        let xfer_req = agent1.create_xfer_req(
+            XferOp::Write,
+            &local_dlist,
+            &remote_dlist,
+            "agent2",
+            None
+        ).expect("Failed to create transfer request");
+
+        let result = agent1.post_xfer_req(&xfer_req, Some(&opt_args));
+        assert!(result.is_ok(), "post_xfer_req failed with error: {:?}", result.err());
+
+        // Wait for transfer to complete
+        loop {
+            match agent1.get_xfer_status(&xfer_req) {
+                Ok(XferStatus::Success) => break,
+                Ok(XferStatus::InProgress) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => panic!("Failed to get transfer status: {:?}", e),
+            }
+        }
+
+        // Try to get telemetry data - should fail with NoTelemetry
+        let telemetry_result = xfer_req.get_telemetry();
+        assert!(telemetry_result.is_err(), "get_xfer_telemetry should fail when telemetry is disabled");
+
+        match telemetry_result.err().unwrap() {
+            NixlError::NoTelemetry => {
+                println!("Correctly received NoTelemetry error");
+            }
+            other => panic!("Expected NoTelemetry error, got: {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn test_get_xfer_telemetry_before_posting() {
+    env::set_var("NIXL_TELEMETRY_ENABLE", "1");
+
+    let (agent1, opt_args) = create_agent_with_backend("agent1").expect("Failed to create agent");
+    let (agent2, opt_args_remote) = create_agent_with_backend("agent2").expect("Failed to create agent");
+
+    // Create descriptor lists
+    let mut storage_list = create_storage_list(&agent1, &opt_args, 1);
+    let mut remote_storage_list = create_storage_list(&agent2, &opt_args_remote, 1);
+
+    {
+        let local_dlist = create_dlist(&mut storage_list).expect("Failed to create descriptor list");
+        let remote_dlist = create_dlist(&mut remote_storage_list).expect("Failed to create descriptor list");
+
+        exchange_metadata(&agent1, &agent2).expect("Failed to exchange metadata");
+
+        // Create transfer request
+        let xfer_req = agent1.create_xfer_req(
+            XferOp::Write,
+            &local_dlist,
+            &remote_dlist,
+            "agent2",
+            None
+        ).expect("Failed to create transfer request");
+
+        // Try to get telemetry before posting the request - should fail
+        let telemetry_result = xfer_req.get_telemetry();
+        assert!(telemetry_result.is_err(), "get_xfer_telemetry should fail before transfer is posted");
+        let error = telemetry_result.err().unwrap();
+        match error {
+            NixlError::NoTelemetry | NixlError::BackendError => {
+                println!("Got expected error before posting: {:?}", error);
+            }
+            other => panic!("Expected NoTelemetry or BackendError, got: {:?}", other),
+        }
+
+        println!("Successfully tested telemetry before posting - got expected error");
+    }
+}
+
+// Tests for equality operators on RegDescList and XferDescList
+#[test]
+fn test_descriptor_list_equality() {
+    // Test RegDescList equality scenarios
+    {
+        // 1. Empty lists of same type should be equal
+        let reg_list1 = RegDescList::new(MemType::Dram).unwrap();
+        let reg_list2 = RegDescList::new(MemType::Dram).unwrap();
+        assert_eq!(reg_list1, reg_list2);
+        assert!(!(reg_list1 != reg_list2));
+
+        // 2. Lists with different memory types should not be equal
+        let reg_list_vram = RegDescList::new(MemType::Vram).unwrap();
+        assert_ne!(reg_list1, reg_list_vram);
+        assert!(!(reg_list1 == reg_list_vram));
+
+        // 3. Lists with same descriptors should be equal
+        let mut reg_list3 = RegDescList::new(MemType::Dram).unwrap();
+        let mut reg_list4 = RegDescList::new(MemType::Dram).unwrap();
+
+        reg_list3.add_desc(0x1000, 0x100, 0).unwrap();
+        reg_list3.add_desc(0x2000, 0x200, 1).unwrap();
+
+        reg_list4.add_desc(0x1000, 0x100, 0).unwrap();
+        reg_list4.add_desc(0x2000, 0x200, 1).unwrap();
+
+        assert_eq!(reg_list3, reg_list4);
+        assert!(!(reg_list3 != reg_list4));
+
+        // 4. Lists with different descriptors should not be equal
+        let mut reg_list5 = RegDescList::new(MemType::Dram).unwrap();
+        let mut reg_list6 = RegDescList::new(MemType::Dram).unwrap();
+
+        reg_list5.add_desc(0x1000, 0x100, 0).unwrap();
+        reg_list6.add_desc(0x2000, 0x200, 1).unwrap();
+
+        assert_ne!(reg_list5, reg_list6);
+        assert!(!(reg_list5 == reg_list6));
+
+        // 5. Lists with different lengths should not be equal
+        let mut reg_list7 = RegDescList::new(MemType::Dram).unwrap();
+        let reg_list8 = RegDescList::new(MemType::Dram).unwrap();
+
+        reg_list7.add_desc(0x1000, 0x100, 0).unwrap();
+
+        assert_ne!(reg_list7, reg_list8);
+        assert!(!(reg_list7 == reg_list8));
+
+        // 6. Lists with same descriptors but different order should not be equal
+        let mut reg_list9 = RegDescList::new(MemType::Dram).unwrap();
+        let mut reg_list10 = RegDescList::new(MemType::Dram).unwrap();
+
+        reg_list9.add_desc(0x1000, 0x100, 0).unwrap();
+        reg_list9.add_desc(0x2000, 0x200, 1).unwrap();
+
+        reg_list10.add_desc(0x2000, 0x200, 1).unwrap();
+        reg_list10.add_desc(0x1000, 0x100, 0).unwrap();
+
+        assert_ne!(reg_list9, reg_list10);
+        assert!(!(reg_list9 == reg_list10));
+
+        // 7. Lists with same descriptors but different metadata should not be equal
+        let mut reg_list11 = RegDescList::new(MemType::Dram).unwrap();
+        let mut reg_list12 = RegDescList::new(MemType::Dram).unwrap();
+
+        reg_list11.add_desc_with_meta(0x1000, 0x100, 0, b"metadata1").unwrap();
+        reg_list12.add_desc_with_meta(0x1000, 0x100, 0, b"metadata2").unwrap();
+
+        assert_ne!(reg_list11, reg_list12);
+        assert!(!(reg_list11 == reg_list12));
+    }
+
+    // Test XferDescList equality scenarios (same tests as RegDescList)
+    {
+        // 1. Empty lists of same type should be equal
+        let xfer_list1 = XferDescList::new(MemType::Dram).unwrap();
+        let xfer_list2 = XferDescList::new(MemType::Dram).unwrap();
+        assert_eq!(xfer_list1, xfer_list2);
+        assert!(!(xfer_list1 != xfer_list2));
+
+        // 2. Lists with different memory types should not be equal
+        let xfer_list_vram = XferDescList::new(MemType::Vram).unwrap();
+        assert_ne!(xfer_list1, xfer_list_vram);
+        assert!(!(xfer_list1 == xfer_list_vram));
+
+        // 3. Lists with same descriptors should be equal
+        let mut xfer_list3 = XferDescList::new(MemType::Dram).unwrap();
+        let mut xfer_list4 = XferDescList::new(MemType::Dram).unwrap();
+
+        xfer_list3.add_desc(0x1000, 0x100, 0).unwrap();
+        xfer_list3.add_desc(0x2000, 0x200, 1).unwrap();
+
+        xfer_list4.add_desc(0x1000, 0x100, 0).unwrap();
+        xfer_list4.add_desc(0x2000, 0x200, 1).unwrap();
+
+        assert_eq!(xfer_list3, xfer_list4);
+        assert!(!(xfer_list3 != xfer_list4));
+
+        // 4. Lists with different descriptors should not be equal
+        let mut xfer_list5 = XferDescList::new(MemType::Dram).unwrap();
+        let mut xfer_list6 = XferDescList::new(MemType::Dram).unwrap();
+
+        xfer_list5.add_desc(0x1000, 0x100, 0).unwrap();
+        xfer_list6.add_desc(0x2000, 0x200, 1).unwrap();
+
+        assert_ne!(xfer_list5, xfer_list6);
+        assert!(!(xfer_list5 == xfer_list6));
+
+        // 5. Lists with different lengths should not be equal
+        let mut xfer_list7 = XferDescList::new(MemType::Dram).unwrap();
+        let xfer_list8 = XferDescList::new(MemType::Dram).unwrap();
+
+        xfer_list7.add_desc(0x1000, 0x100, 0).unwrap();
+
+        assert_ne!(xfer_list7, xfer_list8);
+        assert!(!(xfer_list7 == xfer_list8));
+
+        // 6. Lists with same descriptors but different order should not be equal
+        let mut xfer_list9 = XferDescList::new(MemType::Dram).unwrap();
+        let mut xfer_list10 = XferDescList::new(MemType::Dram).unwrap();
+
+        xfer_list9.add_desc(0x1000, 0x100, 0).unwrap();
+        xfer_list9.add_desc(0x2000, 0x200, 1).unwrap();
+
+        xfer_list10.add_desc(0x2000, 0x200, 1).unwrap();
+        xfer_list10.add_desc(0x1000, 0x100, 0).unwrap();
+
+        assert_ne!(xfer_list9, xfer_list10);
+        assert!(!(xfer_list9 == xfer_list10));
+    }
 }

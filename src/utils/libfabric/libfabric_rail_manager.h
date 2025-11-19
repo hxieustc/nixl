@@ -38,10 +38,10 @@ class nixlLibfabricTopology;
 /** Central manager for multi-rail RDMA operations with topology awareness */
 class nixlLibfabricRailManager {
 public:
-    /** Initialize rail manager with topology discovery and create rails based on available EFA
-     * devices
+    /** Initialize rail manager with topology discovery and create rails based on available
+     * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
-     * @throws std::runtime_error if topology discovery or rail creation fails
+     * @throws std::runtime_error if initialization fails
      */
     nixlLibfabricRailManager(size_t striping_threshold);
     /** Destroy rail manager and cleanup all resources */
@@ -50,18 +50,22 @@ public:
     // Rail management
     /** Create data rails for high-bandwidth transfers (one per EFA device)
      * @param efa_devices List of EFA device names to create rails on
+     * @param provider_name Provider name ("efa" or "efa-direct")
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    createDataRails(const std::vector<std::string> &efa_devices);
+    createDataRails(const std::vector<std::string> &efa_devices, const std::string &provider_name);
 
     /** Create control rails for connection management and notifications
      * @param efa_devices List of EFA device names
+     * @param provider_name Provider name ("efa" or "efa-direct")
      * @param num_control_rails Number of control rails to create
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    createControlRails(const std::vector<std::string> &efa_devices, size_t num_control_rails);
+    createControlRails(const std::vector<std::string> &efa_devices,
+                       const std::string &provider_name,
+                       size_t num_control_rails);
 
     // Access rails
     /** Get reference to data rail by ID */
@@ -105,6 +109,7 @@ public:
      * @param buffer Memory buffer to register
      * @param length Buffer size in bytes
      * @param mem_type Memory type (DRAM_SEG or VRAM_SEG)
+     * @param gpu_id GPU device ID (used for VRAM_SEG, ignored for DRAM_SEG)
      * @param mr_list_out Memory registration handles, indexed by rail ID
      * @param key_list_out Remote access keys, indexed by rail ID
      * @param selected_rails_out List of rail IDs where memory was registered
@@ -114,6 +119,7 @@ public:
     registerMemory(void *buffer,
                    size_t length,
                    nixl_mem_t mem_type,
+                   int gpu_id,
                    std::vector<struct fid_mr *> &mr_list_out,
                    std::vector<uint64_t> &key_list_out,
                    std::vector<size_t> &selected_rails_out);
@@ -132,14 +138,15 @@ public:
     /** Insert addresses into address vectors for all rails of specified type
      * @param rail_type Type of rails to operate on (DATA or CONTROL)
      * @param endpoints Remote endpoint addresses to insert
-     * @param fi_addrs_out Libfabric address handles for inserted endpoints
+     * @param fi_addrs_out Libfabric address handles for inserted endpoints,
+     *                     indexed by local rail id.
      * @param ep_names_out Local endpoint names for reference
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
     insertAllAddresses(RailType rail_type,
                        const std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints,
-                       std::vector<fi_addr_t> &fi_addrs_out,
+                       std::unordered_map<size_t, std::vector<fi_addr_t>> &fi_addrs_out,
                        std::vector<char *> &ep_names_out);
     /** Clean up connection resources for specified rail type
      * @param rail_type Type of rails to clean up (DATA or CONTROL)
@@ -157,6 +164,7 @@ public:
      * @param selected_rails Rails to use for the transfer
      * @param local_mrs Local memory registrations
      * @param remote_keys Remote access keys
+     * @param remote_selected_endpoints Selected remote endpoints, where remote keys are registered
      * @param dest_addrs Destination addresses for each rail
      * @param agent_idx Remote agent index for immediate data
      * @param completion_callback Callback for completion notification
@@ -171,7 +179,8 @@ public:
                              const std::vector<size_t> &selected_rails,
                              const std::vector<struct fid_mr *> &local_mrs,
                              const std::vector<uint64_t> &remote_keys,
-                             const std::vector<fi_addr_t> &dest_addrs,
+                             const std::vector<size_t> &remote_selected_endpoints,
+                             const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t agent_idx,
                              std::function<void()> completion_callback,
                              BinaryNotification *binary_notif);
@@ -254,12 +263,14 @@ public:
     serializeMemoryKeys(const std::vector<uint64_t> &keys, void *buffer, std::string &str) const;
     /** Deserialize memory keys and remote address
      * @param serialized_data Serialized memory information
+     * @param num_keys Number of keys
      * @param keys_out Remote access keys for all rails
      * @param remote_addr_out Remote buffer address
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
     deserializeMemoryKeys(const std::string &serialized_data,
+                          const size_t num_keys,
                           std::vector<uint64_t> &keys_out,
                           uint64_t &remote_addr_out) const;
     // SerDes-based Connection Info Serialization
@@ -286,6 +297,7 @@ public:
 
 private:
     size_t striping_threshold_;
+
     // Rail allocation
     std::vector<std::unique_ptr<nixlLibfabricRail>> data_rails_;
     std::vector<std::unique_ptr<nixlLibfabricRail>> control_rails_;
@@ -300,10 +312,11 @@ private:
 
     // Active Rail Tracking System
     std::unordered_set<size_t> active_rails_;
+    mutable std::mutex active_rails_mutex_;
 
     // Internal rail selection method
     std::vector<size_t>
-    selectRailsForMemory(void *mem_addr, nixl_mem_t mem_type) const;
+    selectRailsForMemory(void *mem_addr, nixl_mem_t mem_type, int gpu_id) const;
 
     // Helper functions for connection SerDes
     void
@@ -314,7 +327,6 @@ private:
     deserializeRailEndpoints(
         nixlSerDes &ser_des,
         const std::string &key_prefix,
-        size_t expected_count,
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints_out) const;
 };
 

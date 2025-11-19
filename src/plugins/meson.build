@@ -13,10 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ucx_backend_inc_dirs = include_directories('./ucx')
-
-subdir('ucx')
-subdir('ucx_mo')
+if ucx_dep.found()
+    subdir('ucx')
+endif
 
 subdir('posix')  # Always try to build POSIX backend, it will handle its own dependencies
 subdir('obj')  # Always try to build Obj backend, it will handle its own dependencies
@@ -45,6 +44,12 @@ hf3fs_lib_file = 'hf3fs_api_shared'
 hf3fs_lib_found = cc.find_library(hf3fs_lib_file, dirs: [hf3fs_lib_path], required: false)
 if hf3fs_lib_found.found()
     subdir('hf3fs')
+endif
+
+gusli_lib_file = 'gusli_clnt'
+gusli_lib_found = cc.find_library(gusli_lib_file, required: false)
+if gusli_lib_found.found()
+    subdir('gusli')
 endif
 
 if cuda_dep.found() and doca_gpunetio_dep.found()

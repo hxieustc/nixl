@@ -65,8 +65,15 @@ int main(int argc, char** argv) {
     char *plugindir = NULL;
     std::set<nixl_backend_t> staticPlugs;
 
-    std::set<std::string> plugins = {
-        "UCX", "GDS", "POSIX", "UCX_MO", "MOCK_BACKEND", "GPUNETIO", "OBJ", "GDS_MT", "LIBFABRIC"};
+    std::set<std::string> plugins = {"UCX",
+                                     "GDS",
+                                     "POSIX",
+                                     "MOCK_BACKEND",
+                                     "GPUNETIO",
+                                     "OBJ",
+                                     "GDS_MT",
+                                     "LIBFABRIC",
+                                     "GUSLI"};
 
     if (argc > 1 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
         print_usage(argv[0]);
@@ -117,9 +124,11 @@ int main(int argc, char** argv) {
         std::cout << " - " << name << std::endl;
     }
 
-    // Plugins loaded should only be the static plugins
-    if (plugin_manager.getLoadedPluginNames().size() !=
-        staticPlugs.size()) {
+    // Plugins loaded should only be the static plugins + Mooncake which doesn't unload
+    auto loaded_plugins = plugin_manager.getLoadedPluginNames();
+    loaded_plugins.erase(std::remove(loaded_plugins.begin(), loaded_plugins.end(), "Mooncake"),
+                         loaded_plugins.end());
+    if (loaded_plugins.size() != staticPlugs.size()) {
         std::cerr << "TEST FAILED: Dynamic Plugins are still loaded." << std::endl;
         return -1;
     }
