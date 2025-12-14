@@ -60,9 +60,8 @@ awsS3Client::awsS3Client(nixl_b_params_t *custom_params,
 
 void
 awsS3Client::setExecutor(std::shared_ptr<Aws::Utils::Threading::Executor> executor) {
-    throw std::runtime_error(
-        "AwsS3Client::setExecutor() not supported - "
-        "AWS SDK doesn't allow changing executor after client creation");
+    throw std::runtime_error("AwsS3Client::setExecutor() not supported - "
+                             "AWS SDK doesn't allow changing executor after client creation");
 }
 
 void
@@ -118,11 +117,10 @@ awsS3Client::getObjectAsync(std::string_view key,
 
     s3Client_->GetObjectAsync(
         request,
-        [callback, stream_factory](
-            const Aws::S3::S3Client *,
-            const Aws::S3::Model::GetObjectRequest &,
-            const Aws::S3::Model::GetObjectOutcome &outcome,
-            const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
+        [callback, stream_factory](const Aws::S3::S3Client *,
+                                   const Aws::S3::Model::GetObjectRequest &,
+                                   const Aws::S3::Model::GetObjectOutcome &outcome,
+                                   const std::shared_ptr<const Aws::Client::AsyncCallerContext> &) {
             callback(outcome.IsSuccess());
         },
         nullptr);

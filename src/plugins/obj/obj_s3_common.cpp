@@ -26,22 +26,17 @@ createAWSCredentials(nixl_b_params_t *custom_params) {
     std::string access_key, secret_key, session_token;
 
     auto access_key_it = custom_params->find("access_key");
-    if (access_key_it != custom_params->end()) 
-        access_key = access_key_it->second;
+    if (access_key_it != custom_params->end()) access_key = access_key_it->second;
 
     auto secret_key_it = custom_params->find("secret_key");
-    if (secret_key_it != custom_params->end()) 
-        secret_key = secret_key_it->second;
+    if (secret_key_it != custom_params->end()) secret_key = secret_key_it->second;
 
     auto session_token_it = custom_params->find("session_token");
-    if (session_token_it != custom_params->end()) 
-        session_token = session_token_it->second;
+    if (session_token_it != custom_params->end()) session_token = session_token_it->second;
 
-    if (access_key.empty() || secret_key.empty()) 
-        return std::nullopt;
+    if (access_key.empty() || secret_key.empty()) return std::nullopt;
 
-    if (session_token.empty()) 
-        return Aws::Auth::AWSCredentials(access_key, secret_key);
+    if (session_token.empty()) return Aws::Auth::AWSCredentials(access_key, secret_key);
 
     return Aws::Auth::AWSCredentials(access_key, secret_key, session_token);
 }
@@ -58,8 +53,8 @@ getUseVirtualAddressing(nixl_b_params_t *custom_params) {
         else if (value == "false")
             return false;
         else
-            throw std::runtime_error("Invalid value for use_virtual_addressing: '" + 
-                                     value + "'. Must be 'true' or 'false'");
+            throw std::runtime_error("Invalid value for use_virtual_addressing: '" + value +
+                                     "'. Must be 'true' or 'false'");
     }
 
     return false;
@@ -75,13 +70,10 @@ getBucketName(nixl_b_params_t *custom_params) {
     }
 
     const char *env_bucket = std::getenv("AWS_DEFAULT_BUCKET");
-    if (env_bucket && env_bucket[0] != '\0') 
-        return std::string(env_bucket);
+    if (env_bucket && env_bucket[0] != '\0') return std::string(env_bucket);
 
-    throw std::runtime_error(
-        "Bucket name not found. Please provide 'bucket' in custom_params or "
-        "set AWS_DEFAULT_BUCKET environment variable");
+    throw std::runtime_error("Bucket name not found. Please provide 'bucket' in custom_params or "
+                             "set AWS_DEFAULT_BUCKET environment variable");
 }
 
 } // namespace nixl_s3_utils
-

@@ -73,4 +73,3 @@ private:
 };
 
 #endif // OBJ_S3_CRT_CLIENT_H
-

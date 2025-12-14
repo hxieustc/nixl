@@ -73,8 +73,7 @@ configureClientCommon(ConfigType &config, nixl_b_params_t *custom_params) {
     }
 
     auto region_it = custom_params->find("region");
-    if (region_it != custom_params->end()) 
-        config.region = region_it->second;
+    if (region_it != custom_params->end()) config.region = region_it->second;
 
     auto req_checksum_it = custom_params->find("req_checksum");
     if (req_checksum_it != custom_params->end()) {
@@ -85,17 +84,14 @@ configureClientCommon(ConfigType &config, nixl_b_params_t *custom_params) {
             config.checksumConfig.requestChecksumCalculation =
                 Aws::Client::RequestChecksumCalculation::WHEN_SUPPORTED;
         else
-            throw std::runtime_error("Invalid value for req_checksum: '" + 
-                                     req_checksum_it->second +
+            throw std::runtime_error("Invalid value for req_checksum: '" + req_checksum_it->second +
                                      "'. Must be 'required' or 'supported'");
     }
 
     auto ca_bundle_it = custom_params->find("ca_bundle");
-    if (ca_bundle_it != custom_params->end()) 
-        config.caFile = ca_bundle_it->second;
+    if (ca_bundle_it != custom_params->end()) config.caFile = ca_bundle_it->second;
 }
 
 } // namespace nixl_s3_utils
 
 #endif // OBJ_S3_COMMON_H
-

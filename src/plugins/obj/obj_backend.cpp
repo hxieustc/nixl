@@ -45,8 +45,9 @@ getCrtMinLimit(nixl_b_params_t *custom_params) {
     if (it != custom_params->end()) {
         try {
             return std::stoull(it->second);
-        } catch (const std::exception &e) {
-            NIXL_WARN << "Invalid crtMinLimit value: " << it->second 
+        }
+        catch (const std::exception &e) {
+            NIXL_WARN << "Invalid crtMinLimit value: " << it->second
                       << ", using default (CRT disabled)";
             return std::numeric_limits<size_t>::max();
         }
@@ -258,7 +259,7 @@ nixlObjEngine::postXfer(const nixl_xfer_op_t &operation,
 
         // Select client based on data size vs threshold
         bool use_crt = (s3CrtClient_ && data_len >= crtMinLimit_);
-        
+
         NIXL_DEBUG << "Transfer " << i << ": size=" << data_len << " bytes, using "
                    << (use_crt ? "S3 CRT" : "S3 Standard") << " client";
 
@@ -266,26 +267,42 @@ nixlObjEngine::postXfer(const nixl_xfer_op_t &operation,
         // for the status code. Use future/promise pair to bridge the gap.
         if (operation == NIXL_WRITE) {
             if (use_crt)
-                s3CrtClient_->putObjectAsync(
-                    obj_key_search->second, data_ptr, data_len, offset, [status_promise](bool success) {
-                        status_promise->set_value(success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
-                    });
+                s3CrtClient_->putObjectAsync(obj_key_search->second,
+                                             data_ptr,
+                                             data_len,
+                                             offset,
+                                             [status_promise](bool success) {
+                                                 status_promise->set_value(
+                                                     success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
+                                             });
             else
-                s3Client_->putObjectAsync(
-                    obj_key_search->second, data_ptr, data_len, offset, [status_promise](bool success) {
-                        status_promise->set_value(success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
-                    });
+                s3Client_->putObjectAsync(obj_key_search->second,
+                                          data_ptr,
+                                          data_len,
+                                          offset,
+                                          [status_promise](bool success) {
+                                              status_promise->set_value(success ? NIXL_SUCCESS :
+                                                                                  NIXL_ERR_BACKEND);
+                                          });
         } else {
             if (use_crt)
-                s3CrtClient_->getObjectAsync(
-                    obj_key_search->second, data_ptr, data_len, offset, [status_promise](bool success) {
-                        status_promise->set_value(success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
-                    });
+                s3CrtClient_->getObjectAsync(obj_key_search->second,
+                                             data_ptr,
+                                             data_len,
+                                             offset,
+                                             [status_promise](bool success) {
+                                                 status_promise->set_value(
+                                                     success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
+                                             });
             else
-                s3Client_->getObjectAsync(
-                    obj_key_search->second, data_ptr, data_len, offset, [status_promise](bool success) {
-                        status_promise->set_value(success ? NIXL_SUCCESS : NIXL_ERR_BACKEND);
-                    });
+                s3Client_->getObjectAsync(obj_key_search->second,
+                                          data_ptr,
+                                          data_len,
+                                          offset,
+                                          [status_promise](bool success) {
+                                              status_promise->set_value(success ? NIXL_SUCCESS :
+                                                                                  NIXL_ERR_BACKEND);
+                                          });
         }
     }
 
