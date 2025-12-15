@@ -476,8 +476,9 @@ xferBenchConfig::printConfig() {
                         obj_req_checksum);
             printOption("OBJ S3 CA bundle (--obj_ca_bundle=cert-path)", obj_ca_bundle);
             printOption("OBJ S3 CRT min limit (--obj_crt_min_limit=N bytes)",
-                        obj_crt_min_limit > 0 ? std::to_string(obj_crt_min_limit) + " (CRT enabled)" 
-                                               : "0 (CRT disabled)");
+                        obj_crt_min_limit > 0 ?
+                            std::to_string(obj_crt_min_limit) + " (CRT enabled)" :
+                            "0 (CRT disabled)");
         }
 
         if (xferBenchConfig::isStorageBackend()) {
