@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#ifndef OBJ_S3_CRT_CLIENT_H
-#define OBJ_S3_CRT_CLIENT_H
+#ifndef OBJ_PLUGIN_S3_CRT_CLIENT_H
+#define OBJ_PLUGIN_S3_CRT_CLIENT_H
 
 #include <functional>
 #include <memory>
@@ -27,7 +27,7 @@
 #include <aws/core/Aws.h>
 #include "nixl_types.h"
 
-// Forward declaration from obj_s3_client.h
+// Forward declaration from s3/client.h
 using put_object_callback_t = std::function<void(bool success)>;
 using get_object_callback_t = std::function<void(bool success)>;
 
@@ -72,4 +72,4 @@ private:
     Aws::String bucketName_;
 };
 
-#endif // OBJ_S3_CRT_CLIENT_H
+#endif // OBJ_PLUGIN_S3_CRT_CLIENT_H

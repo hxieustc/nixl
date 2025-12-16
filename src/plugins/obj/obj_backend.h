@@ -19,8 +19,8 @@
 #define OBJ_BACKEND_H
 
 #include "obj_executor.h"
-#include "obj_s3_client.h"
-#include "obj_s3_crt_client.h"
+#include "s3/client.h"
+#include "s3_crt/client.h"
 #include <string>
 #include <memory>
 #include <unordered_map>

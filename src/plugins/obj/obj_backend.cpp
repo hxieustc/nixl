@@ -16,7 +16,7 @@
  */
 
 #include "obj_backend.h"
-#include "obj_s3_crt_client.h"
+#include "s3_crt/client.h"
 #include "common/nixl_log.h"
 #include "nixl_types.h"
 #include <absl/strings/str_format.h>

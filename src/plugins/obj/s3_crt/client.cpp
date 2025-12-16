@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "obj_s3_crt_client.h"
+#include "client.h"
 #include "object/s3/utils.h"
 #include <aws/s3-crt/model/PutObjectRequest.h>
 #include <aws/s3-crt/model/GetObjectRequest.h>
