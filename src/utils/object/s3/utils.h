@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-#ifndef OBJ_S3_COMMON_H
-#define OBJ_S3_COMMON_H
+#ifndef NIXL_S3_UTILS_H
+#define NIXL_S3_UTILS_H
 
 #include <optional>
 #include <string>
@@ -94,4 +94,4 @@ configureClientCommon(ConfigType &config, nixl_b_params_t *custom_params) {
 
 } // namespace nixl_s3_utils
 
-#endif // OBJ_S3_COMMON_H
+#endif // NIXL_S3_UTILS_H

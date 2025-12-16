@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "obj_s3_common.h"
+#include "utils.h"
 
 namespace nixl_s3_utils {
 

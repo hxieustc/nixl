@@ -16,7 +16,7 @@
  */
 
 #include "obj_s3_client.h"
-#include "obj_s3_common.h"
+#include "object/s3/utils.h"
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
