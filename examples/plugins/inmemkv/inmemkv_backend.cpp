@@ -25,7 +25,7 @@
  * (see nixlLocalSection teardown path).
  *
  * Implementation:
- * - Storage: kv_store_[key] = vector<uint8_t> (in-process only)
+ * - Storage: store_->put/get over InMemKVStore (in-process only)
  * - Transfer: synchronous PUT/GET in postXfer; prepXfer validates and allocates a placeholder handle
  */
 
@@ -34,7 +34,6 @@
 #include "nixl_types.h"
 #include <absl/strings/str_format.h>
 #include <memory>
-#include <cstring>
 #include <algorithm>
 
 namespace {
@@ -123,16 +122,14 @@ isValidPrepXferParams(const nixl_xfer_op_t &operation,
  * @brief Construct INMEMKV backend engine
  *
  * Step 1: Read localAgent from init_params.
- * Step 2: In-memory store only (no filesystem).
+ * Step 2: Use default in-memory iKVStore implementation (no filesystem).
  * Logs: INMEMKV backend initialized ; Local agent =
  */
 nixlInMemKVEngine::nixlInMemKVEngine(const nixlBackendInitParams *init_params)
-    : nixlBackendEngine(init_params) {
+    : nixlBackendEngine(init_params),
+      store_(std::make_unique<InMemKVStore>()) {
 
-    // 1. Local agent name
-    localAgent = init_params->localAgent;
-
-    // 2. Values live only in kv_store_ (no file persistence).
+    // 2. Values live only in store_ (no file persistence).
 
     NIXL_INFO << "INMEMKV backend initialized (in-memory only)";
     NIXL_INFO << "INMEMKV: Local agent = " << localAgent;
@@ -215,7 +212,7 @@ nixlInMemKVEngine::queryMem(const nixl_reg_dlist_t &descs,
 
         // Same pattern as nixlObjEngine::queryMem: no lock; S3 uses network, we use local map
         // with serialized agent/backend calls (devIdToKey_ is also unprotected).
-        const bool exists = kv_store_.find(key) != kv_store_.end();
+        const bool exists = store_->exists(key);
 
         NIXL_DEBUG << "queryMem: key=" << key << ", exists=" << exists;
 
@@ -260,7 +257,7 @@ nixlInMemKVEngine::prepXfer(const nixl_xfer_op_t &operation,
 /**
  * @brief Post transfer operation (execute PUT/GET)
  *
- * Step 1: In-memory kv_store_ only (no initiator/target split, no filesystem).
+ * Step 1: In-memory store_ only (no initiator/target split, no filesystem).
  * Step 2: Resolve key from remote metadata or devIdToKey_ per descriptor.
  * Step 3: WRITE copies local buffer to kv_store_[key]; READ copies from kv_store_[key] to local buffer.
  * Logs: postXfer: Starting WRITE/READ ... ; Local operation - using in-memory store ; ...
@@ -279,7 +276,7 @@ nixlInMemKVEngine::postXfer(const nixl_xfer_op_t &operation,
     (void)handle;
     (void)opt_args;
 
-    NIXL_INFO << "postXfer: Local operation - using in-memory store";
+    NIXL_INFO << "postXfer: Local operation - using key-value store interface";
 
     for (int i = 0; i < local.descCount(); ++i) {
         const auto &local_desc = local[i];
@@ -328,20 +325,18 @@ nixlInMemKVEngine::postXfer(const nixl_xfer_op_t &operation,
                      << " bytes from buffer to key=" << key;
 
             // ========================================================
-            // Local WRITE: Write to in-memory store
+            // Local WRITE: Write via key-value store interface
             // ========================================================
-            // Resize vector to hold the data
-            kv_store_[key].resize(data_len);
-
-            // Copy data from user buffer to map
-            std::memcpy(kv_store_[key].data(),
-                       reinterpret_cast<const void *>(data_ptr),
-                       data_len);
+            const auto write_status =
+                store_->put(key, reinterpret_cast<const uint8_t *>(data_ptr), data_len);
+            if (write_status != NIXL_SUCCESS) {
+                NIXL_ERROR << "postXfer:   WRITE: Failed to store key=" << key
+                           << ", status=" << write_status;
+                return write_status;
+            }
 
             NIXL_INFO << "postXfer:   WRITE: Successfully stored " << data_len
                      << " bytes in key=" << key;
-            NIXL_INFO << "postXfer:   WRITE: kv_store_ now has "
-                      << kv_store_.size() << " keys";
 
         } else {
             // ============================================================
@@ -350,27 +345,27 @@ nixlInMemKVEngine::postXfer(const nixl_xfer_op_t &operation,
             NIXL_INFO << "postXfer:   READ: Retrieving data from key=" << key;
 
             // ========================================================
-            // Local READ: Read from in-memory store
+            // Local READ: Read via key-value store interface
             // ========================================================
-            // Check if key exists
-            auto it = kv_store_.find(key);
-            if (it == kv_store_.end()) {
+            size_t bytes_read = 0;
+            const auto read_status =
+                store_->get(key, reinterpret_cast<uint8_t *>(data_ptr), data_len, bytes_read);
+            if (read_status == NIXL_ERR_BACKEND) {
                 NIXL_ERROR << "postXfer:   READ: Key not found: " << key;
                 return NIXL_ERR_BACKEND;
             }
-
-            // Check if data size matches
-            size_t stored_len = it->second.size();
-            if (stored_len < data_len) {
-                NIXL_WARN << "postXfer:   READ: Stored data size (" << stored_len
-                         << ") < requested size (" << data_len << ")";
-                data_len = stored_len;  // Read only what's available
+            if (read_status != NIXL_SUCCESS) {
+                NIXL_ERROR << "postXfer:   READ: Failed to read key=" << key
+                           << ", status=" << read_status;
+                return read_status;
             }
 
-            // Copy data from map to user buffer
-            std::memcpy(reinterpret_cast<void *>(data_ptr),
-                       it->second.data(),
-                       data_len);
+            // Check if data size matches
+            if (bytes_read < data_len) {
+                NIXL_WARN << "postXfer:   READ: Stored data size (" << bytes_read
+                         << ") < requested size (" << data_len << ")";
+                data_len = bytes_read; // Read only what's available
+            }
 
             NIXL_INFO << "postXfer:   READ: Successfully retrieved " << data_len
                      << " bytes from key=" << key;

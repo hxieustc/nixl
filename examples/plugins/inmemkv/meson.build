@@ -16,6 +16,8 @@
 inmemkv_sources = [
     'inmemkv_backend.cpp',
     'inmemkv_backend.h',
+    'inmemkv_store.cpp',
+    'inmemkv_store.h',
     'inmemkv_plugin.cpp',
 ]
 

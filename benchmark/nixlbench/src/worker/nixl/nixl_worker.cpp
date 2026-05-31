@@ -313,6 +313,11 @@ xferBenchNixlWorker::xferBenchNixlWorker(const std::vector<std::string> &devices
         backend_params["container_name"] = xferBenchConfig::azure_blob_container_name;
         backend_params["connection_string"] = xferBenchConfig::azure_blob_connection_string;
         std::cout << "AZURE_BLOB backend" << std::endl;
+#if NIXLBENCH_ENABLE_INMEMKV
+    } else if (0 == xferBenchConfig::backend.compare(XFERBENCH_BACKEND_INMEMKV)) {
+        std::cout << "INMEMKV backend configured (simple in-memory key-value store)"
+                  << std::endl;
+#endif
     } else {
         std::cerr << "Unsupported NIXLBench backend: " << xferBenchConfig::backend << std::endl;
         exit(EXIT_FAILURE);

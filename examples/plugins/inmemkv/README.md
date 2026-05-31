@@ -4,13 +4,17 @@ INMEMKV is a small dynamic NIXL backend plugin that implements an in-process key
 
 ## Introduction
 
-The plugin stores bytes in:
+The plugin stores bytes through a minimal KV storage interface:
 
 ```cpp
-std::unordered_map<std::string, std::vector<uint8_t>> kv_store_;
+class iKVStore {
+  virtual nixl_status_t put(std::string_view key, const uint8_t *data, size_t len) = 0;
+  virtual nixl_status_t get(std::string_view key, uint8_t *buffer, size_t len, size_t &bytes_read) const = 0;
+  virtual bool exists(std::string_view key) const = 0;
+};
 ```
 
-Each registered descriptor names a key through `metaInfo`; if `metaInfo` is empty, INMEMKV falls back to a string form of `devId`. A `NIXL_WRITE` copies bytes from the user buffer into the map. A `NIXL_READ` copies bytes from the map back into the user buffer.
+`InMemKVStore` provides the default in-memory implementation with `std::unordered_map`. Each registered descriptor names a key through `metaInfo`; if `metaInfo` is empty, INMEMKV falls back to a string form of `devId`. A `NIXL_WRITE` calls `store_->put(...)`. A `NIXL_READ` calls `store_->get(...)`.
 
 ## What It Demonstrates
 
@@ -99,7 +103,9 @@ nixlbench has a small amount of INMEMKV-specific code because INMEMKV behaves li
 - `meson.build`: builds `libplugin_INMEMKV.so` as a build-tree-only dynamic plugin.
 - `inmemkv_plugin.cpp`: exports `nixl_plugin_init` and `nixl_plugin_fini`, and registers the backend name `INMEMKV`.
 - `inmemkv_backend.h`: declares the `nixlInMemKVEngine` class and the backend methods it implements.
-- `inmemkv_backend.cpp`: implements registration, transfer preparation, PUT/GET, completion, cleanup, and local metadata handling.
+- `inmemkv_backend.cpp`: implements registration, transfer preparation, key resolution, completion, cleanup, and local metadata handling.
+- `inmemkv_store.h`: defines `iKVStore` and the `InMemKVStore` implementation interface.
+- `inmemkv_store.cpp`: implements the in-memory `put/get/exists` operations.
 - `INMEMKV_ARCHITECTURE.md`: explains the plugin lifecycle and the design choices in more detail.
 
 A good reading order is:

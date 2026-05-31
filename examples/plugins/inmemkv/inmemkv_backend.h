@@ -41,21 +41,22 @@
 #define INMEMKV_BACKEND_H
 
 #include "backend/backend_engine.h"
+#include "inmemkv_store.h"
 #include "nixl_types.h"
+#include <memory>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 /**
  * @class nixlInMemKVEngine
  * @brief Simple in-memory key-value store backend for NIXL
  *
- * This backend implements a synchronous, in-memory key-value store using std::unordered_map.
+ * This backend implements a synchronous, in-memory key-value store via a minimal iKVStore interface.
  * It's designed to be simple and easy to understand, making it perfect for learning
  * how NIXL plugins work.
  *
  * Architecture:
- * - Storage: std::unordered_map<std::string, std::vector<uint8_t>>
+ * - Storage: iKVStore (default implementation is InMemKVStore)
  * - Operations: Synchronous (no async complexity)
  * - Thread Safety: Like nixlObjEngine, no internal locking; assume serialized backend calls
  *
@@ -114,7 +115,7 @@ public:
 
     /**
      * @brief Query if memory descriptors exist
-     * For each descriptor, key = metaInfo or devId string; check kv_store_.
+     * For each descriptor, key = metaInfo or devId string; check kv_store_ via iKVStore.
      * @param descs Descriptors to query
      * @param resp Output responses (exists -> nixl_b_params_t{}, not exists -> nullopt)
      * @return NIXL_SUCCESS
@@ -152,8 +153,8 @@ public:
      * @brief Post transfer operation (execute PUT/GET)
      *
      * Steps: (1) In-memory only (no filesystem); (2) resolve key from remote metadata or devIdToKey_;
-     * (3) WRITE: memcpy to kv_store_[key]; (4) READ: memcpy from kv_store_[key] to local buffer.
-     * Logs: postXfer: Starting WRITE/READ ... ; Local operation - using in-memory store ; Found key ...
+     * (3) WRITE: store_->put(...); (4) READ: store_->get(...).
+     * Logs: postXfer: Starting WRITE/READ ... ; Local operation - using key-value store interface ; Found key ...
      *
      * @param operation Transfer operation (NIXL_WRITE = PUT, NIXL_READ = GET)
      * @param local Local memory descriptors
@@ -261,37 +262,20 @@ public:
     loadLocalMD(nixlBackendMD *input, nixlBackendMD *&output) override;
 
 private:
-    /**
-     * @brief Get the local agent name
-     * @return Local agent name
-     */
-    std::string
-    getLocalAgent() const {
-        return localAgent;
-    }
-
     // ========================================================================
     // Internal Storage and State
     // ========================================================================
 
     /**
-     * @brief In-memory key-value store
-     *
-     * Key: std::string (from metaInfo or devId)
-     * Value: std::vector<uint8_t> (binary data)
+     * @brief Minimal KV storage interface implementation for INMEMKV.
      */
-    mutable std::unordered_map<std::string, std::vector<uint8_t>> kv_store_;
+    std::unique_ptr<iKVStore> store_;
 
     /**
      * @brief Mapping from devId to key
      * Used to look up keys when only devId is available
      */
     std::unordered_map<uint64_t, std::string> devIdToKey_;
-
-    /**
-     * @brief Local agent name
-     */
-    std::string localAgent;
 
 };
 
