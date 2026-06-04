@@ -56,7 +56,7 @@
  * how NIXL plugins work.
  *
  * Architecture:
- * - Storage: iKVStore (default implementation is InMemKVStore)
+ * - Storage: shared iKVStore in src/plugins/kv (InMemKVStore in this example plugin)
  * - Operations: Synchronous (no async complexity)
  * - Thread Safety: Like nixlObjEngine, no internal locking; assume serialized backend calls
  *

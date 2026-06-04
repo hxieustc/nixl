@@ -15,40 +15,19 @@
  * limitations under the License.
  */
 
+/**
+ * @file inmemkv_store.h
+ * @brief In-memory implementation of the shared iKVStore interface for INMEMKV.
+ */
+
 #ifndef INMEMKV_STORE_H
 #define INMEMKV_STORE_H
 
-#include "nixl_types.h"
-#include <cstddef>
-#include <cstdint>
+#include "kv_store.h"
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
-
-/**
- * @brief Minimal key-value storage interface for INMEMKV backend.
- *
- * This interface intentionally keeps only the smallest synchronous API
- * needed by the current INMEMKV backend flow.
- */
-class iKVStore {
-public:
-    virtual ~iKVStore() = default;
-
-    virtual nixl_status_t put(std::string_view key, const uint8_t *data, size_t len) = 0;
-
-    /**
-     * @brief Reads value for key into buffer.
-     *
-     * bytes_read is set to min(stored_len, len) on success.
-     * Returns NIXL_ERR_BACKEND when key does not exist.
-     */
-    virtual nixl_status_t
-    get(std::string_view key, uint8_t *buffer, size_t len, size_t &bytes_read) const = 0;
-
-    virtual bool exists(std::string_view key) const = 0;
-};
 
 /**
  * @brief In-memory implementation of iKVStore using unordered_map.

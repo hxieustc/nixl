@@ -4,17 +4,14 @@ INMEMKV is a small dynamic NIXL backend plugin that implements an in-process key
 
 ## Introduction
 
-The plugin stores bytes through a minimal KV storage interface:
+The plugin stores bytes through the shared `iKVStore` interface defined in
+`src/plugins/kv/kv_store.h`. That header is intended for all KV-style backends
+(for example INMEMKV in this example directory and REDIS under `src/plugins/redis`).
 
-```cpp
-class iKVStore {
-  virtual nixl_status_t put(std::string_view key, const uint8_t *data, size_t len) = 0;
-  virtual nixl_status_t get(std::string_view key, uint8_t *buffer, size_t len, size_t &bytes_read) const = 0;
-  virtual bool exists(std::string_view key) const = 0;
-};
-```
-
-`InMemKVStore` provides the default in-memory implementation with `std::unordered_map`. Each registered descriptor names a key through `metaInfo`; if `metaInfo` is empty, INMEMKV falls back to a string form of `devId`. A `NIXL_WRITE` calls `store_->put(...)`. A `NIXL_READ` calls `store_->get(...)`.
+`InMemKVStore` in this directory provides the in-memory implementation using
+`std::unordered_map`. Each registered descriptor names a key through `metaInfo`;
+if `metaInfo` is empty, INMEMKV falls back to a string form of `devId`.
+A `NIXL_WRITE` calls `store_->put(...)`. A `NIXL_READ` calls `store_->get(...)`.
 
 ## What It Demonstrates
 
@@ -104,8 +101,9 @@ nixlbench has a small amount of INMEMKV-specific code because INMEMKV behaves li
 - `inmemkv_plugin.cpp`: exports `nixl_plugin_init` and `nixl_plugin_fini`, and registers the backend name `INMEMKV`.
 - `inmemkv_backend.h`: declares the `nixlInMemKVEngine` class and the backend methods it implements.
 - `inmemkv_backend.cpp`: implements registration, transfer preparation, key resolution, completion, cleanup, and local metadata handling.
-- `inmemkv_store.h`: defines `iKVStore` and the `InMemKVStore` implementation interface.
-- `inmemkv_store.cpp`: implements the in-memory `put/get/exists` operations.
+- `src/plugins/kv/kv_store.h`: shared `iKVStore` interface for KV backends.
+- `inmemkv_store.h`: `InMemKVStore` implementation of `iKVStore`.
+- `inmemkv_store.cpp`: in-memory `put/get/exists` operations.
 - `INMEMKV_ARCHITECTURE.md`: explains the plugin lifecycle and the design choices in more detail.
 
 A good reading order is:
