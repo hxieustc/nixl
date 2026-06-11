@@ -17,266 +17,42 @@
 
 /**
  * @file inmemkv_backend.h
- * @brief INMEMKV Backend Header - Simple in-memory key-value store for learning NIXL
+ * @brief INMEMKV example plugin - thin engine wrapper around nixlKVEngine.
  *
  * Architecture:
- * - Apps (e.g. nixlbench) create nixlAgent with backend "INMEMKV" and call
- *   registerMem / prepXfer / postXfer / checkXfer / releaseReqH / deregisterMem.
- * - nixlAgent routes by memory type (DRAM_SEG, ...) to this backend.
- * - This engine implements nixlBackendEngine: register/deregister, prep/exec/check transfer,
- *   release handles; if supportsRemote, also conn info, metadata serialization, connect/unloadMD.
  *
- * Lifecycle: createBackend -> registerMem -> prepXfer -> postXfer
- * -> checkXfer -> releaseReqH -> deregisterMem; unloadMD is no-op (same as Obj - no free there).
+ *   nixlInMemKVEngine          Registered with NIXL; extends nixlKVEngine
+ *        |
+ *        v
+ *   nixlKVEngine               Shared thin wrapper in src/plugins/kv/
+ *        |
+ *        v
+ *   nixlInMemKVEngineImpl      Plugin-specific logic (inmemkv_engine_impl.*)
+ *        |
+ *        v
+ *   InMemKVStore (iKVStore)    In-memory put/get/exists (inmemkv_store.*)
  *
- * See INMEMKV_ARCHITECTURE.md in this directory for diagrams and log meanings.
- *
- * Key Features:
- * - Synchronous operations (simple to understand)
- * - In-memory storage (no external dependencies)
- * - Full NIXL backend interface implementation
+ * See INMEMKV_ARCHITECTURE.md and src/plugins/kv/kv_engine_impl.h for details.
  */
 
 #ifndef INMEMKV_BACKEND_H
 #define INMEMKV_BACKEND_H
 
-#include "backend/backend_engine.h"
-#include "inmemkv_store.h"
-#include "nixl_types.h"
+#include "kv_engine.h"
 #include <memory>
-#include <string>
-#include <unordered_map>
 
 /**
  * @class nixlInMemKVEngine
- * @brief Simple in-memory key-value store backend for NIXL
+ * @brief INMEMKV backend engine registered with the NIXL plugin loader.
  *
- * This backend implements a synchronous, in-memory key-value store via a minimal iKVStore interface.
- * It's designed to be simple and easy to understand, making it perfect for learning
- * how NIXL plugins work.
- *
- * Architecture:
- * - Storage: shared iKVStore in src/plugins/kv (InMemKVStore in this example plugin)
- * - Operations: Synchronous (no async complexity)
- * - Thread Safety: Like nixlObjEngine, no internal locking; assume serialized backend calls
- *
- * Supported Operations:
- * - registerMem: Register memory descriptors with keys
- * - prepXfer: Prepare transfer operations
- * - postXfer: Execute PUT/GET operations (synchronous)
- * - checkXfer: Check operation status (always returns SUCCESS immediately)
- * - queryMem: Check if a key exists
+ * This class is intentionally thin: it wires the shared nixlKVEngine wrapper
+ * to a nixlInMemKVEngineImpl instance at construction time.
  */
-class nixlInMemKVEngine : public nixlBackendEngine {
+class nixlInMemKVEngine : public nixlKVEngine {
 public:
-    /**
-     * @brief Construct INMEMKV backend engine
-     * @param init_params Initialization parameters from NIXL
-     */
     explicit nixlInMemKVEngine(const nixlBackendInitParams *init_params);
 
-    /**
-     * @brief Destructor
-     */
     ~nixlInMemKVEngine() override = default;
-
-    // ========================================================================
-    // Phase 2: register / deregister (registerMem / deregisterMem)
-    // ========================================================================
-
-    /**
-     * @brief Register memory descriptor with the backend
-     *
-     * Steps: (1) Key from metaInfo or stringified devId; (2) allocate nixlInMemKVMetadata(devId, key);
-     * (3) devIdToKey_[devId]=key for postXfer; (4) return meta, ownership to caller.
-     * Logs: registerMem: type=..., devId=..., metaInfo=... ; registered devId=... -> key=...
-     *
-     * @param mem Memory descriptor (devId, metaInfo, etc.)
-     * @param nixl_mem Memory type (must be DRAM_SEG)
-     * @param out Output metadata pointer (caller takes ownership)
-     * @return NIXL_SUCCESS on success
-     */
-    nixl_status_t
-    registerMem(const nixlBlobDesc &mem,
-                const nixl_mem_t &nixl_mem,
-                nixlBackendMD *&out) override;
-
-    /**
-     * @brief Deregister memory descriptor
-     *
-     * Same as obj_backend (S3): erase devIdToKey_ and free metadata with unique_ptr.
-     * Log: deregisterMem: removing devId=..., key=...
-     *
-     * @param meta Metadata pointer from registerMem
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    deregisterMem(nixlBackendMD *meta) override;
-
-    /**
-     * @brief Query if memory descriptors exist
-     * For each descriptor, key = metaInfo or devId string; check kv_store_ via iKVStore.
-     * @param descs Descriptors to query
-     * @param resp Output responses (exists -> nixl_b_params_t{}, not exists -> nullopt)
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    queryMem(const nixl_reg_dlist_t &descs, std::vector<nixl_query_resp_t> &resp) const override;
-
-    // ========================================================================
-    // Phase 3: prep / post / check / release (prepXfer -> postXfer -> checkXfer -> releaseReqH)
-    // ========================================================================
-
-    /**
-     * @brief Prepare transfer operation
-     *
-     * Steps: (1) Validate WRITE/READ and DRAM_SEG on both sides; (2) allocate placeholder handle.
-     * INMEMKV is synchronous - handle is a stub. Log: prepXfer: operation=..., local_count=..., remote_count=...
-     *
-     * @param operation Transfer operation (NIXL_WRITE or NIXL_READ)
-     * @param local Local memory descriptors
-     * @param remote Remote memory descriptors
-     * @param remote_agent Remote agent name
-     * @param handle Output request handle
-     * @param opt_args Optional arguments
-     * @return NIXL_SUCCESS on success
-     */
-    nixl_status_t
-    prepXfer(const nixl_xfer_op_t &operation,
-             const nixl_meta_dlist_t &local,
-             const nixl_meta_dlist_t &remote,
-             const std::string &remote_agent,
-             nixlBackendReqH *&handle,
-             const nixl_opt_b_args_t *opt_args) const override;
-
-    /**
-     * @brief Post transfer operation (execute PUT/GET)
-     *
-     * Steps: (1) In-memory only (no filesystem); (2) resolve key from remote metadata or devIdToKey_;
-     * (3) WRITE: store_->put(...); (4) READ: store_->get(...).
-     * Logs: postXfer: Starting WRITE/READ ... ; Local operation - using key-value store interface ; Found key ...
-     *
-     * @param operation Transfer operation (NIXL_WRITE = PUT, NIXL_READ = GET)
-     * @param local Local memory descriptors
-     * @param remote Remote memory descriptors
-     * @param remote_agent Remote agent name
-     * @param handle Request handle from prepXfer
-     * @param opt_args Optional arguments
-     * @return NIXL_SUCCESS (synchronous, complete immediately)
-     */
-    nixl_status_t
-    postXfer(const nixl_xfer_op_t &operation,
-             const nixl_meta_dlist_t &local,
-             const nixl_meta_dlist_t &remote,
-             const std::string &remote_agent,
-             nixlBackendReqH *&handle,
-             const nixl_opt_b_args_t *opt_args) const override;
-
-    /**
-     * @brief Check transfer operation status
-     * INMEMKV is synchronous; always SUCCESS (work done in postXfer).
-     * @param handle Request handle
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    checkXfer(nixlBackendReqH *handle) const override;
-
-    /**
-     * @brief Release request handle
-     * Frees handle from prepXfer. Log: releaseReqH: Releasing request handle
-     * @param handle Request handle to release
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    releaseReqH(nixlBackendReqH *handle) const override;
-
-    /**
-     * @brief Get supported memory types
-     * @return Vector of supported memory types (DRAM_SEG only)
-     */
-    nixl_mem_list_t
-    getSupportedMems() const override {
-        return {DRAM_SEG};
-    }
-
-    /**
-     * @brief Check if backend supports remote operations
-     * @return false (INMEMKV is local in-memory only)
-     */
-    bool
-    supportsRemote() const override {
-        return false;
-    }
-
-    /**
-     * @brief Check if backend supports local operations
-     * @return true (INMEMKV supports local operations)
-     */
-    bool
-    supportsLocal() const override {
-        return true;
-    }
-
-    /**
-     * @brief Check if backend supports notifications
-     * @return false (not needed for local-only backend)
-     */
-    bool
-    supportsNotif() const override {
-        return false;
-    }
-
-    /**
-     * @brief Connect (local-only no-op)
-     * @param remote_agent Remote agent name
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    connect(const std::string &remote_agent) override;
-
-    /**
-     * @brief Disconnect (local-only no-op)
-     * @param remote_agent Remote agent name
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    disconnect(const std::string &remote_agent) override;
-
-    /**
-     * @brief Unload metadata (same as nixlObjEngine: no free here; free only in deregisterMem)
-     *
-     * @param input Metadata pointer (ignored)
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    unloadMD(nixlBackendMD *input) override;
-
-    /**
-     * @brief Load local metadata for local transfers
-     * Pass-through: output = input.
-     * @param input Local metadata
-     * @param output Output metadata pointer (same as input)
-     * @return NIXL_SUCCESS
-     */
-    nixl_status_t
-    loadLocalMD(nixlBackendMD *input, nixlBackendMD *&output) override;
-
-private:
-    // ========================================================================
-    // Internal Storage and State
-    // ========================================================================
-
-    /**
-     * @brief Minimal KV storage interface implementation for INMEMKV.
-     */
-    std::unique_ptr<iKVStore> store_;
-
-    /**
-     * @brief Mapping from devId to key
-     * Used to look up keys when only devId is available
-     */
-    std::unordered_map<uint64_t, std::string> devIdToKey_;
-
 };
 
 #endif // INMEMKV_BACKEND_H

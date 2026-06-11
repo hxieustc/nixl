@@ -1,14 +1,8 @@
 # INMEMKV Architecture Guide
 
-This guide explains how the INMEMKV example plugin fits into NIXL and what parts are useful when writing a new backend plugin.
+This guide explains how the INMEMKV example plugin fits into NIXL and how its layered KV backend design works.
 
-INMEMKV is intentionally small. It does not try to be a complete storage system. Its job is to show the shape of a NIXL backend with the fewest moving pieces:
-
-- one dynamic plugin entry point file
-- one backend engine class
-- local registration and deregistration
-- synchronous transfer execution
-- simple metadata ownership
+INMEMKV is intentionally small. It demonstrates a KV-style NIXL backend with the fewest moving pieces.
 
 ## Big Picture
 
@@ -17,7 +11,7 @@ A NIXL application does not call a backend plugin directly. It creates a `nixlAg
 For INMEMKV, the layers look like this:
 
 ```text
-Application, for example nixlbench
+Application (e.g. nixlbench)
   selects backend "INMEMKV"
   builds descriptor lists
   calls nixlAgent APIs
@@ -30,22 +24,79 @@ nixlAgent
   routes calls to the backend engine
         |
         v
-nixlInMemKVEngine
-  registers DRAM descriptors as KV keys
-  prepares synchronous requests
-  copies bytes into/out of an in-process map
-  releases request handles and metadata
+nixlInMemKVEngine          Plugin entry (extends nixlKVEngine)
+        |
+        v
+nixlKVEngine               Shared thin wrapper (src/plugins/kv/)
+  delegates all data-plane calls to impl_
+        |
+        v
+nixlInMemKVEngineImpl      Plugin-specific logic (inmemkv_engine_impl.*)
+  registerMem, prepXfer, postXfer, ...
+        |
+        v
+InMemKVStore (iKVStore)    Storage put/get/exists (inmemkv_store.*)
 ```
+
+### Layer Responsibilities
+
+| Layer | Class | Role |
+|-------|-------|------|
+| NIXL-facing engine | `nixlKVEngine` | Thin wrapper; implements `nixlBackendEngine` |
+| Abstract impl interface | `nixlKVEngineImpl` | Backend-specific logic contract |
+| Concrete impl | `nixlInMemKVEngineImpl` | INMEMKV register/transfer implementation |
+| Storage abstraction | `iKVStore` | put/get/exists storage operations |
+| Shared headers | `src/plugins/kv/` | Reusable across KV backends |
 
 The important separation is:
 
-- The application decides what descriptors it wants to register and transfer.
-- The NIXL core manages plugin loading, backend instances, metadata lists, and request flow.
-- The backend implements the storage-specific behavior behind the `nixlBackendEngine` interface.
+- The **application** decides what descriptors it wants to register and transfer.
+- The **NIXL core** manages plugin loading, backend instances, metadata lists, and request flow.
+- **`nixlKVEngine`** implements the `nixlBackendEngine` contract and forwards calls.
+- **`nixlKVEngineImpl`** subclasses implement backend-specific behavior.
+- **`iKVStore`** isolates raw put/get/exists storage from NIXL descriptor mapping.
+
+## Shared KV Headers (`src/plugins/kv/`)
+
+### `kv_store.h` — `iKVStore`
+
+Minimal storage interface shared by all KV backends:
+
+```cpp
+class iKVStore {
+    virtual bool put(key, data, len) = 0;
+    virtual bool get(key, data, len, out_len) = 0;
+    virtual bool exists(key) = 0;
+};
+```
+
+INMEMKV uses `InMemKVStore` (`std::unordered_map`). A future REDIS plugin would use `RedisKVStore` (hiredis).
+
+### `kv_engine_impl.h` — `nixlKVEngineImpl`
+
+Abstract interface for KV backend logic. Each KV plugin provides a concrete subclass implementing:
+
+- `getSupportedMems()`
+- `registerMem` / `deregisterMem` / `queryMem`
+- `prepXfer` / `postXfer` / `checkXfer` / `releaseReqH`
+
+Note: `prepXfer` receives `local_agent` explicitly so impl classes do not depend on `nixlBackendEngine` protected members.
+
+### `kv_engine.h` / `kv_engine.cpp` — `nixlKVEngine`
+
+Thin wrapper extending `nixlBackendEngine`. Declares common KV capabilities:
+
+```cpp
+supportsLocal()  == true
+supportsRemote() == false
+supportsNotif()  == false
+```
+
+All data-plane methods delegate to `impl_` in `kv_engine.cpp`.
 
 ## Dynamic Plugin Entry Point
 
-`inmemkv_plugin.cpp` is the plugin boundary. NIXL discovers `libplugin_INMEMKV.so`, opens it dynamically, and looks for:
+`inmemkv_plugin.cpp` is the plugin boundary. NIXL discovers `libplugin_INMEMKV.so` and calls:
 
 ```cpp
 extern "C" NIXL_PLUGIN_EXPORT nixlBackendPlugin *nixl_plugin_init();
@@ -54,231 +105,104 @@ extern "C" NIXL_PLUGIN_EXPORT void nixl_plugin_fini();
 
 `nixl_plugin_init()` returns plugin metadata and an engine factory through `nixlBackendPluginCreator<nixlInMemKVEngine>::create(...)`.
 
-For INMEMKV, the registration says:
+## Plugin Wiring
+
+`inmemkv_backend.cpp` is minimal — it only wires the factory:
 
 ```cpp
-inmemkv_plugin_t::create(
-    NIXL_PLUGIN_API_VERSION,
-    "INMEMKV",
-    "0.1.0",
-    {},
-    {DRAM_SEG}
-);
+nixlInMemKVEngine::nixlInMemKVEngine(const nixlBackendInitParams *init_params)
+    : nixlKVEngine(init_params, createInMemKVEngineImpl(init_params)) {}
 ```
 
-That means:
-
-- The backend name is `INMEMKV`.
-- It uses the current NIXL plugin API version.
-- It supports `DRAM_SEG` descriptors.
-- NIXL should construct `nixlInMemKVEngine` when an agent creates this backend.
-
-## Backend Engine Contract
-
-`nixlInMemKVEngine` derives from `nixlBackendEngine`. A real backend does not need to implement every possible NIXL feature, but it must describe what it supports and implement the methods needed for that support.
-
-INMEMKV advertises:
-
-```cpp
-supportsLocal()  == true
-supportsRemote() == false
-supportsNotif()  == false
-```
-
-This makes INMEMKV a local-only backend. There is no remote connection protocol, no cross-process metadata exchange, and no notification mechanism. That is deliberate: it keeps the example focused on the core lifecycle.
-
-The key methods to study are:
-
-- `registerMem`
-- `deregisterMem`
-- `prepXfer`
-- `postXfer`
-- `checkXfer`
-- `releaseReqH`
-- `getSupportedMems`
-- `loadLocalMD`
-- `unloadMD`
+The factory function `createInMemKVEngineImpl()` returns a `std::unique_ptr<nixlKVEngineImpl>`.
 
 ## Data Model
 
-INMEMKV stores opaque bytes in a process-local map:
-
-```cpp
-std::unordered_map<std::string, std::vector<uint8_t>> kv_store_;
-```
-
-Each registered memory descriptor is interpreted as a key. The key comes from:
+Each registered memory descriptor is interpreted as a KV key:
 
 1. `mem.metaInfo`, when provided
 2. `std::to_string(mem.devId)`, as a fallback
 
-The backend also keeps a lookup table:
+`nixlInMemKVEngineImpl` keeps:
 
 ```cpp
 std::unordered_map<uint64_t, std::string> devIdToKey_;
+std::unique_ptr<iKVStore> store_;
 ```
 
-That lets `postXfer()` resolve a key from the remote descriptor's `devId` when metadata is not available directly.
+`postXfer()` resolves the key from remote metadata or `devIdToKey_`, then calls `store_->put()` or `store_->get()`.
 
 ## Lifecycle
 
-A typical INMEMKV flow is:
-
 ```text
-1. create backend
-2. register memory descriptors
-3. prepare transfer
-4. post transfer
-5. check transfer status
-6. release transfer request handle
-7. deregister memory descriptors
-8. unload metadata during cleanup, if core asks for it
+1. create backend          nixlInMemKVEngine -> nixlKVEngine -> nixlInMemKVEngineImpl
+2. register memory         registerMem() -> nixlInMemKVMetadata + devIdToKey_
+3. prepare transfer        prepXfer() -> allocate request handle
+4. post transfer           postXfer() -> store_->put/get (synchronous)
+5. check transfer          checkXfer() -> NIXL_SUCCESS (already done)
+6. release request handle  releaseReqH()
+7. deregister memory       deregisterMem() -> free metadata
 ```
 
-The same flow with method names:
+## Step-by-Step Implementation Guide
 
-```text
-nixlAgent::createBackend("INMEMKV", ...)
-  -> nixlInMemKVEngine(...)
+When adding a new KV backend (e.g. REDIS), follow these steps:
 
-nixlAgent::registerMem(...)
-  -> nixlInMemKVEngine::registerMem(...)
+### Step 1: Implement `iKVStore`
 
-nixlAgent::createXferReq(...) or related transfer setup
-  -> nixlInMemKVEngine::prepXfer(...)
+Create a storage class in your plugin directory:
 
-nixlAgent::postXferReq(...)
-  -> nixlInMemKVEngine::postXfer(...)
-
-nixlAgent::getXferStatus(...)
-  -> nixlInMemKVEngine::checkXfer(...)
-
-nixlAgent::releaseXferReq(...)
-  -> nixlInMemKVEngine::releaseReqH(...)
-
-nixlAgent::deregisterMem(...)
-  -> nixlInMemKVEngine::deregisterMem(...)
+```cpp
+class RedisKVStore : public iKVStore { ... };
 ```
 
-## Step-by-Step
+### Step 2: Implement `nixlKVEngineImpl`
 
-### 1. Register Memory
+Create `redis_engine_impl.h/.cpp`:
 
-`registerMem()` is where INMEMKV turns a NIXL descriptor into backend metadata.
-
-It does four things:
-
-1. Verifies that the memory type is `DRAM_SEG`.
-2. Chooses a key from `metaInfo` or `devId`.
-3. Allocates `nixlInMemKVMetadata` containing `devId` and key.
-4. Records `devId -> key` in `devIdToKey_`.
-
-The returned `nixlBackendMD *` is owned by the NIXL local section path and is freed later by `deregisterMem()`.
-
-### 2. Prepare Transfer
-
-`prepXfer()` checks that the request is something INMEMKV understands:
-
-- operation is `NIXL_WRITE` or `NIXL_READ`
-- local descriptor list uses `DRAM_SEG`
-- remote descriptor list uses `DRAM_SEG`
-
-INMEMKV is synchronous, so it does not need a real asynchronous work object. It still allocates a small request handle because the NIXL backend interface expects one.
-
-### 3. Post Transfer
-
-`postXfer()` is where the data moves.
-
-For `NIXL_WRITE`:
-
-```text
-local user buffer -> kv_store_[key]
+```cpp
+class nixlRedisKVEngineImpl : public nixlKVEngineImpl {
+    std::unique_ptr<iKVStore> store_;
+    // registerMem, prepXfer, postXfer, ...
+};
 ```
 
-For `NIXL_READ`:
+Copy the descriptor/key mapping logic from `nixlInMemKVEngineImpl` and adapt storage calls.
 
-```text
-kv_store_[key] -> local user buffer
+### Step 3: Create thin engine wrapper
+
+```cpp
+class nixlRedisKVEngine : public nixlKVEngine {
+public:
+    explicit nixlRedisKVEngine(const nixlBackendInitParams *p)
+        : nixlKVEngine(p, std::make_unique<nixlRedisKVEngineImpl>(p)) {}
+};
 ```
 
-The key is resolved from remote metadata when possible. If metadata is not present, the backend uses `remote_desc.devId` and `devIdToKey_`.
+### Step 4: Register plugin
 
-### 4. Check Transfer
+Use `nixlBackendPluginCreator<nixlRedisKVEngine>` in `redis_plugin.cpp`.
 
-`checkXfer()` always returns `NIXL_SUCCESS` because `postXfer()` already completed the operation.
+### Step 5: Build
 
-An asynchronous backend would usually poll hardware, a queue, a service, or an internal state machine here.
-
-### 5. Release Request Handle
-
-`releaseReqH()` deletes the placeholder request handle allocated by `prepXfer()`.
-
-### 6. Deregister Memory
-
-`deregisterMem()` removes the `devId -> key` mapping and frees the metadata object.
-
-This is the ownership point to pay attention to when writing a backend: if `registerMem()` allocates backend metadata, `deregisterMem()` should release it.
-
-### 7. Unload Metadata
-
-`unloadMD()` is a no-op in INMEMKV. This mirrors simple local/storage-style backends where metadata is released through deregistration rather than remote-section teardown.
-
-Do not use `unloadMD()` to free the same metadata that `deregisterMem()` owns, or you risk double-free behavior.
-
-## Why nixlbench Has INMEMKV-Specific Handling
-
-NIXL can discover and load INMEMKV dynamically through `NIXL_PLUGIN_DIR`, but nixlbench still has to construct descriptor lists that match the backend.
-
-Most nixlbench storage backends use file-like descriptors:
-
-```text
-FILE_SEG + file descriptor + file offset
-```
-
-INMEMKV uses:
-
-```text
-DRAM_SEG + key in metaInfo
-```
-
-So nixlbench needs guarded `NIXLBENCH_ENABLE_INMEMKV` code in a few places:
-
-- allocate/register INMEMKV descriptors as `DRAM_SEG`
-- deregister INMEMKV descriptors as `DRAM_SEG`
-- exchange IOVs without file descriptors
-- prepare remote transfer descriptors as `DRAM_SEG`
-
-That benchmark glue is not part of the plugin API itself. It is only needed because nixlbench has backend-specific descriptor setup logic.
-
-## What To Copy For A New Plugin
-
-Useful patterns to copy:
-
-- Keep plugin registration small and explicit in a `*_plugin.cpp` file.
-- Put backend behavior in a `nixlBackendEngine` subclass.
-- Clearly state supported memory types in `getSupportedMems()` and plugin registration.
-- Allocate backend metadata in `registerMem()` and free it in `deregisterMem()`.
-- Validate descriptor types and operation kinds in `prepXfer()`.
-- Keep request-handle ownership clear: allocate in `prepXfer()`, release in `releaseReqH()`.
-- Return `NIXL_SUCCESS` from `checkXfer()` only if work is actually complete.
-
-Things that are example-specific:
-
-- The in-process `unordered_map`
-- The `metaInfo` key convention
-- The synchronous `postXfer()` implementation
-- The lack of locking
-- The lack of remote support and notifications
+Link `../../../src/plugins/kv/kv_engine.cpp` in your plugin's `meson.build`.
 
 ## File Map
 
 ```text
+src/plugins/kv/
+  kv_store.h           iKVStore storage interface
+  kv_engine_impl.h     nixlKVEngineImpl abstract interface
+  kv_engine.h          nixlKVEngine thin wrapper declaration
+  kv_engine.cpp        nixlKVEngine delegation implementation
+
 examples/plugins/inmemkv/
   meson.build               build-tree-only dynamic plugin target
   inmemkv_plugin.cpp         plugin entry points and backend registration
-  inmemkv_backend.h          backend class declaration and API summary
-  inmemkv_backend.cpp        backend implementation
-  README.md                 quick start and usage notes
+  inmemkv_backend.h/.cpp     thin nixlInMemKVEngine wrapper + factory
+  inmemkv_engine_impl.h/.cpp nixlInMemKVEngineImpl (backend logic)
+  inmemkv_store.h/.cpp       InMemKVStore (iKVStore implementation)
+  README.md                  quick start and usage notes
   INMEMKV_ARCHITECTURE.md    this guide
 ```
 
@@ -286,9 +210,10 @@ examples/plugins/inmemkv/
 
 When learning the code, read in this order:
 
-1. `inmemkv_plugin.cpp`: how NIXL learns the backend name and factory.
-2. `inmemkv_backend.h`: what interface the engine implements.
-3. `registerMem()` in `inmemkv_backend.cpp`: how descriptors become backend metadata.
-4. `prepXfer()` and `postXfer()`: how a NIXL request becomes a PUT or GET.
-5. `releaseReqH()` and `deregisterMem()`: how ownership is cleaned up.
-6. The guarded INMEMKV code in nixlbench, if you want to see how an application prepares descriptors for this backend.
+1. `src/plugins/kv/kv_engine_impl.h` — abstract impl contract
+2. `src/plugins/kv/kv_engine.h` + `kv_engine.cpp` — delegation layer
+3. `inmemkv_plugin.cpp` — how NIXL learns the backend name and factory
+4. `inmemkv_backend.cpp` — factory wiring (3 lines of logic)
+5. `inmemkv_engine_impl.cpp` — `registerMem`, `prepXfer`, `postXfer`
+6. `inmemkv_store.cpp` — raw put/get/exists
+7. Guarded INMEMKV code in nixlbench — how an application prepares descriptors

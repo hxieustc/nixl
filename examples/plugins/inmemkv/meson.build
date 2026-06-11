@@ -14,8 +14,11 @@
 # limitations under the License.
 
 inmemkv_sources = [
+    '../../../src/plugins/kv/kv_engine.cpp',
     'inmemkv_backend.cpp',
     'inmemkv_backend.h',
+    'inmemkv_engine_impl.cpp',
+    'inmemkv_engine_impl.h',
     'inmemkv_store.cpp',
     'inmemkv_store.h',
     'inmemkv_plugin.cpp',
@@ -29,3 +32,6 @@ inmemkv_example_plugin = shared_library(
     include_directories: [nixl_inc_dirs, utils_inc_dirs],
     install: false,
     name_prefix: 'libplugin_')
+
+# Convenience alias so "ninja -C build INMEMKV" works.
+alias_target('INMEMKV', inmemkv_example_plugin)

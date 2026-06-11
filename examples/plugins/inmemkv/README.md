@@ -4,14 +4,25 @@ INMEMKV is a small dynamic NIXL backend plugin that implements an in-process key
 
 ## Introduction
 
-The plugin stores bytes through the shared `iKVStore` interface defined in
-`src/plugins/kv/kv_store.h`. That header is intended for all KV-style backends
-(for example INMEMKV in this example directory and REDIS under `src/plugins/redis`).
+The plugin uses a layered design:
 
-`InMemKVStore` in this directory provides the in-memory implementation using
-`std::unordered_map`. Each registered descriptor names a key through `metaInfo`;
-if `metaInfo` is empty, INMEMKV falls back to a string form of `devId`.
-A `NIXL_WRITE` calls `store_->put(...)`. A `NIXL_READ` calls `store_->get(...)`.
+```text
+nixlInMemKVEngine          Plugin entry (extends nixlKVEngine)
+    -> nixlKVEngine         Shared thin wrapper (src/plugins/kv/kv_engine.h)
+        -> nixlInMemKVEngineImpl   Plugin logic (inmemkv_engine_impl.*)
+            -> InMemKVStore (iKVStore)   Storage (inmemkv_store.*)
+```
+
+Shared headers under `src/plugins/kv/`:
+
+- `kv_store.h` — `iKVStore` put/get/exists storage interface
+- `kv_engine_impl.h` — `nixlKVEngineImpl` abstract backend logic interface
+- `kv_engine.h` / `kv_engine.cpp` — `nixlKVEngine` delegation wrapper
+
+`InMemKVStore` in this directory provides the in-memory `iKVStore` implementation.
+Each registered descriptor names a key through `metaInfo`; if `metaInfo` is empty,
+INMEMKV falls back to a string form of `devId`. A `NIXL_WRITE` calls `store_->put(...)`.
+A `NIXL_READ` calls `store_->get(...)`.
 
 ## What It Demonstrates
 
@@ -38,49 +49,65 @@ Its architecture is detailed in [INMEMKV architecture](INMEMKV_ARCHITECTURE.md).
 
 ## Build
 
-INMEMKV lives under `examples/plugins/inmemkv`. It is built only when the root NIXL build enables examples, and it is not installed by `ninja install`.
+INMEMKV lives under `examples/plugins/inmemkv`. It is built from the **NIXL repository root** (not from `benchmark/nixlbench`). It is gated by `build_examples` (default `true`) and is not installed by `ninja install`.
 
-1. Build NIXL plugin example
+### Step 1: Configure and build the plugin (NIXL root)
 
-From the NIXL repository root:
+Run all commands from the NIXL repository root, for example `/workspace/nixl`:
 
 ```bash
-meson setup build -Dbuild_examples=true --prefix=/usr/local/nixl
+cd /workspace/nixl
+
+# First-time setup, or reconfigure an existing build directory
+meson setup --reconfigure build \
+    -Dbuild_examples=true \
+    --prefix=/usr/local/nixl \
+    --buildtype=release
+
+# Build the plugin (use the output path as the ninja target)
+ninja -C build examples/plugins/inmemkv/libplugin_INMEMKV.so
+```
+
+After a `meson setup --reconfigure`, you can also use the convenience alias:
+
+```bash
 ninja -C build INMEMKV
 ```
 
-The plugin is produced in the build tree:
+Verify the plugin was produced:
 
 ```bash
-build/examples/plugins/inmemkv/libplugin_INMEMKV.so
+ls -l build/examples/plugins/inmemkv/libplugin_INMEMKV.so
 ```
 
-2. Export `NIXL_PLUGIN_DIR`
+`ninja: no work to do` means the plugin is already up to date.
 
-NIXL discovers dynamic plugins from `NIXL_PLUGIN_DIR`, so export the build-tree plugin directory before starting the process that creates the `nixlAgent`:
+### Step 2: Export `NIXL_PLUGIN_DIR`
+
+NIXL discovers dynamic plugins from `NIXL_PLUGIN_DIR`. Export the build-tree plugin directory before starting any process that creates a `nixlAgent`:
 
 ```bash
-export NIXL_PLUGIN_DIR=/path/to/nixl/build/examples/plugins/inmemkv
+export NIXL_PLUGIN_DIR=/workspace/nixl/build/examples/plugins/inmemkv
 ```
 
 The `export` matters: a plain shell assignment is not inherited by child processes.
 
 ## Use With nixlbench
 
-INMEMKV support in nixlbench is gated separately so the benchmark does not depend on this example by default.
+nixlbench is a **separate Meson project** under `benchmark/nixlbench`. Do not pass `-Dbuild_examples` there; use `-Denable_inmemkv` instead.
 
-Build nixlbench with:
+### Step 3: Build nixlbench
 
 ```bash
-cd benchmark/nixlbench
+cd /workspace/nixl/benchmark/nixlbench
 meson setup build -Denable_inmemkv=true -Dnixl_path=/usr/local/nixl
 ninja -C build
 ```
 
-Run with the plugin directory exported and the backend set to `INMEMKV`:
+### Step 4: Run
 
 ```bash
-export NIXL_PLUGIN_DIR=/path/to/nixl/build/examples/plugins/inmemkv
+export NIXL_PLUGIN_DIR=/workspace/nixl/build/examples/plugins/inmemkv
 ./build/nixlbench \
     --backend INMEMKV \
     --op_type WRITE \
@@ -99,19 +126,21 @@ nixlbench has a small amount of INMEMKV-specific code because INMEMKV behaves li
 
 - `meson.build`: builds `libplugin_INMEMKV.so` as a build-tree-only dynamic plugin.
 - `inmemkv_plugin.cpp`: exports `nixl_plugin_init` and `nixl_plugin_fini`, and registers the backend name `INMEMKV`.
-- `inmemkv_backend.h`: declares the `nixlInMemKVEngine` class and the backend methods it implements.
-- `inmemkv_backend.cpp`: implements registration, transfer preparation, key resolution, completion, cleanup, and local metadata handling.
-- `src/plugins/kv/kv_store.h`: shared `iKVStore` interface for KV backends.
-- `inmemkv_store.h`: `InMemKVStore` implementation of `iKVStore`.
-- `inmemkv_store.cpp`: in-memory `put/get/exists` operations.
+- `inmemkv_backend.h/.cpp`: thin `nixlInMemKVEngine` wrapper and impl factory.
+- `inmemkv_engine_impl.h/.cpp`: `nixlInMemKVEngineImpl` (registerMem, prep/postXfer, ...).
+- `inmemkv_store.h/.cpp`: `InMemKVStore` implementing shared `iKVStore`.
+- `src/plugins/kv/kv_store.h`: shared storage interface.
+- `src/plugins/kv/kv_engine_impl.h`: shared backend logic interface.
+- `src/plugins/kv/kv_engine.h/.cpp`: shared `nixlKVEngine` delegation layer.
 - `INMEMKV_ARCHITECTURE.md`: explains the plugin lifecycle and the design choices in more detail.
 
 A good reading order is:
 
 1. `inmemkv_plugin.cpp`
-2. `inmemkv_backend.h`
-3. `inmemkv_backend.cpp`, starting with `registerMem`, `prepXfer`, `postXfer`, and `deregisterMem`
-4. `INMEMKV_ARCHITECTURE.md`
+2. `src/plugins/kv/kv_engine_impl.h` and `kv_engine.h`
+3. `inmemkv_backend.h` and `inmemkv_backend.cpp`
+4. `inmemkv_engine_impl.cpp` (`registerMem`, `prepXfer`, `postXfer`, `deregisterMem`)
+5. `INMEMKV_ARCHITECTURE.md`
 
 ## Lifecycle Summary
 
