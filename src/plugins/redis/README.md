@@ -292,22 +292,35 @@ meson setup build -Denable_plugins=REDIS -Dstatic_plugins=REDIS
 meson compile -C build
 ```
 
-## Live nixlbench smoke test
+## nixlbench benchmark test
 
 The unit tests use an injected Redis client and do not connect to a server. Use this smoke test to
 exercise plugin creation, hiredis/libevent, and an actual Redis write/read data path. The example
 uses a static REDIS plugin so the standalone nixlbench binary does not depend on dynamic plugin
 discovery.
 
-Start an isolated Redis server on the loopback interface and verify that it is ready:
+### Redis server
+
+Start Redis with host networking so the container shares the host network stack
+directly, eliminating the Docker bridge veth overhead. 
+
+To make Redis server as performant as possible, 
+
+1. Pass `--io-threads 4` to enable Redis 6+ threaded socket I/O, which parallelises 
+reads and writes across connections.
+2. use host mode (`--network=host`) to remove docker veth limit
 
 ```bash
 docker run --detach --rm --name nixl-redis-smoke \
-  --publish 127.0.0.1:6379:6379 redis:7-alpine
+  --network=host redis:7-alpine \
+  --io-threads 4 --io-threads-do-reads yes
 docker exec nixl-redis-smoke redis-cli PING
 ```
 
-The readiness command must print `PONG`.
+The readiness command must print `PONG`. With `--network=host` the container
+binds directly to the host's `127.0.0.1:6379`; no `-p` port mapping is needed.
+
+### benchmark test
 
 Install a static REDIS-enabled NIXL build into a temporary prefix, then build nixlbench against
 that installation:
@@ -338,37 +351,31 @@ batch, one in-flight request, 32 warm-up iterations, and 208 measured iterations
 ```bash
 export REDIS_HOST=127.0.0.1
 export REDIS_PORT=6379
+export REDIS_POOL_SIZE=8
 export LD_LIBRARY_PATH="$NIXL_PREFIX/lib/$(uname -m)-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 build-nixlbench/nixlbench \
-  --backend=REDIS \
-  --runtime_type=ASIO \
-  --op_type=WRITE \
-  --start_block_size=4096 \
-  --max_block_size=4096 \
+  --backend REDIS \
+  --op_type WRITE \
+  --start_block_size 131072 \
+  --max_block_size 131072   \
   --start_batch_size=1 \
-  --max_batch_size=1 \
-  --pipeline_depth=1 \
-  --num_threads=1 \
-  --total_buffer_size=67108864 \
-  --warmup_iter=32 \
-  --num_iter=208 \
-  --check_consistency=true
+  --max_batch_size=64 \
+  --num_iter 1000 \
+  --warmup_iter 10 \
+  --num_threads 4
+  
 
 build-nixlbench/nixlbench \
-  --backend=REDIS \
-  --runtime_type=ASIO \
-  --op_type=READ \
-  --start_block_size=4096 \
-  --max_block_size=4096 \
+  --backend REDIS \
+  --op_type READ \
+  --start_block_size 131072 \
+  --max_block_size 131072   \
   --start_batch_size=1 \
-  --max_batch_size=1 \
-  --pipeline_depth=1 \
-  --num_threads=1 \
-  --total_buffer_size=67108864 \
-  --warmup_iter=32 \
-  --num_iter=208 \
-  --check_consistency=true
+  --max_batch_size=64 \
+  --num_iter 1000 \
+  --warmup_iter 10 \
+  --num_threads 4
 ```
 
 Each command must exit successfully and print a result row for block size `4096`. The READ run
