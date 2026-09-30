@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -23,7 +23,7 @@ Options:
     --start-redis           Start a Redis Docker container before benchmarking (default)
     --no-start-redis        Skip container management; assume Redis is already running
     --redis-container NAME  Docker container name  [default: nixl-redis-bench]
-    --redis-io-threads N    Redis --io-threads value  [default: 4]
+    --redis-io-threads N    Redis --io-threads value  [default: auto = physical cores on NUMA node, ≤16]
     --redis-host HOST       Redis host  [default: 127.0.0.1]
     --redis-port PORT       Redis port  [default: 6379]
     --redis-pool-size N     REDIS_POOL_SIZE passed to the plugin  [default: 8]
@@ -63,7 +63,7 @@ NIXLBENCH_SRC = REPO_ROOT / "benchmark" / "nixlbench"
 # Benchmark matrix
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZES_KB = [32, 64, 128, 256, 512]
+BLOCK_SIZES_KB = [128, 256, 512, 1024, 2048, 4096]
 THREAD_COUNTS = [1, 4, 8, 16]
 OPERATIONS = ["WRITE", "READ"]
 
@@ -122,7 +122,9 @@ def build_nixl(
         print(f"  Configuring NIXL in {nixl_build_dir} ...", file=sys.stderr)
         _run_build(
             [
-                meson, "setup", str(nixl_build_dir),
+                meson,
+                "setup",
+                str(nixl_build_dir),
                 f"--prefix={nixl_install_dir}",
                 "-Denable_plugins=REDIS",
                 "-Dstatic_plugins=REDIS",
@@ -131,13 +133,20 @@ def build_nixl(
             label="meson setup nixl",
         )
     else:
-        print(f"  NIXL build dir exists — skipping setup ({nixl_build_dir})", file=sys.stderr)
+        print(
+            f"  NIXL build dir exists — skipping setup ({nixl_build_dir})",
+            file=sys.stderr,
+        )
 
     print("  Compiling NIXL ...", file=sys.stderr)
-    _run_build([meson, "compile", "-C", str(nixl_build_dir)], label="meson compile nixl")
+    _run_build(
+        [meson, "compile", "-C", str(nixl_build_dir)], label="meson compile nixl"
+    )
 
     print("  Installing NIXL ...", file=sys.stderr)
-    _run_build([meson, "install", "-C", str(nixl_build_dir)], label="meson install nixl")
+    _run_build(
+        [meson, "install", "-C", str(nixl_build_dir)], label="meson install nixl"
+    )
 
 
 def build_nixlbench(
@@ -154,7 +163,9 @@ def build_nixlbench(
         print(f"  Configuring nixlbench in {nixlbench_build_dir} ...", file=sys.stderr)
         _run_build(
             [
-                meson, "setup", str(nixlbench_build_dir),
+                meson,
+                "setup",
+                str(nixlbench_build_dir),
                 str(NIXLBENCH_SRC),
                 f"-Dnixl_path={nixl_install_dir}",
             ],
@@ -167,7 +178,10 @@ def build_nixlbench(
         )
 
     print("  Compiling nixlbench ...", file=sys.stderr)
-    _run_build([meson, "compile", "-C", str(nixlbench_build_dir)], label="meson compile nixlbench")
+    _run_build(
+        [meson, "compile", "-C", str(nixlbench_build_dir)],
+        label="meson compile nixlbench",
+    )
 
 
 def ensure_built(bench_dir: Path, rebuild: bool) -> Tuple[Path, Path]:
@@ -200,6 +214,7 @@ def ensure_built(bench_dir: Path, rebuild: bool) -> Tuple[Path, Path]:
 # ---------------------------------------------------------------------------
 # NUMA helpers
 # ---------------------------------------------------------------------------
+
 
 def _numa_node_dirs() -> List[Path]:
     return sorted(Path("/sys/devices/system/node").glob("node[0-9]*"))
@@ -234,12 +249,37 @@ def numa_node_total_kib(node: int) -> int:
         return 0
 
 
+def _parse_cpulist(cpulist: str) -> int:
+    """Count logical CPUs in a cpulist string (e.g. '0-15,32-47' → 32)."""
+    count = 0
+    for part in cpulist.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            try:
+                count += int(hi) - int(lo) + 1
+            except ValueError:
+                pass
+        elif part.isdigit():
+            count += 1
+    return count
+
+
+def numa_node_cpu_count(node: int) -> int:
+    return _parse_cpulist(numa_node_cpulist(node))
+
+
 def detect_best_numa_node() -> int:
-    """Return the NUMA node with the most free memory."""
+    """Return the NUMA node with the most total memory.
+
+    Total memory is a proxy for memory bandwidth: more DIMMs populate more
+    memory channels, raising the theoretical DRAM bandwidth for that node.
+    Ties are broken by free memory so we also avoid a nearly-full node.
+    """
     nodes = detect_numa_nodes()
     if not nodes:
         return 0
-    return max(nodes, key=lambda n: numa_node_free_kib(n))
+    return max(nodes, key=lambda n: (numa_node_total_kib(n), numa_node_free_kib(n)))
 
 
 def numactl_prefix(node: int) -> List[str]:
@@ -254,21 +294,26 @@ def numactl_prefix(node: int) -> List[str]:
 # PCIe helpers
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class PcieDevice:
     address: str
     description: str
-    numa_node: int          # -1 = unknown
-    link_speed: str         # e.g. "16GT/s"
-    link_width: int         # number of lanes, 0 = unknown
-    max_bw_gbps: float      # theoretical unidirectional max in GB/s
+    numa_node: int  # -1 = unknown
+    link_speed: str  # e.g. "16GT/s"
+    link_width: int  # number of lanes, 0 = unknown
+    max_bw_gbps: float  # theoretical unidirectional max in GB/s
 
 
 def _pcie_bw_gbps(speed: str, width: int) -> float:
     """Theoretical unidirectional bandwidth in GB/s from link speed and width."""
     rates = {
-        "2.5GT/s": 2.5, "5GT/s": 5.0, "8GT/s": 8.0,
-        "16GT/s": 16.0, "32GT/s": 32.0, "64GT/s": 64.0,
+        "2.5GT/s": 2.5,
+        "5GT/s": 5.0,
+        "8GT/s": 8.0,
+        "16GT/s": 16.0,
+        "32GT/s": 32.0,
+        "64GT/s": 64.0,
     }
     gts = rates.get(speed, 0.0)
     if gts == 0.0 or width == 0:
@@ -283,7 +328,9 @@ def _pcie_link_info(address: str) -> Tuple[str, int]:
     try:
         r = subprocess.run(
             ["lspci", "-s", address, "-vvv"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "", 0
@@ -312,7 +359,13 @@ def _pcie_numa_node(address: str) -> int:
 
 
 _PCIE_INTERESTING_CLASSES = [
-    "Network", "Ethernet", "InfiniBand", "Non-Volatile", "VGA", "3D", "Display",
+    "Network",
+    "Ethernet",
+    "InfiniBand",
+    "Non-Volatile",
+    "VGA",
+    "3D",
+    "Display",
 ]
 _PCIE_INTERESTING_VENDORS = ["nvidia", "mellanox", "broadcom"]
 
@@ -321,7 +374,10 @@ def collect_pcie_devices() -> List[PcieDevice]:
     """Return key PCIe devices with NUMA affinity and link speed info."""
     try:
         r = subprocess.run(
-            ["lspci", "-vmm"], capture_output=True, text=True, timeout=15,
+            ["lspci", "-vmm"],
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
@@ -345,19 +401,22 @@ def collect_pcie_devices() -> List[PcieDevice]:
         device_name = current.get("Device", "")
         vendor_lower = vendor.lower()
 
-        interesting = any(kw in class_name for kw in _PCIE_INTERESTING_CLASSES) or \
-                      any(v in vendor_lower for v in _PCIE_INTERESTING_VENDORS)
+        interesting = any(kw in class_name for kw in _PCIE_INTERESTING_CLASSES) or any(
+            v in vendor_lower for v in _PCIE_INTERESTING_VENDORS
+        )
 
         if interesting and addr:
             speed, width = _pcie_link_info(addr)
-            devices.append(PcieDevice(
-                address=addr,
-                description=f"{vendor} {device_name}".strip(),
-                numa_node=_pcie_numa_node(addr),
-                link_speed=speed or "—",
-                link_width=width,
-                max_bw_gbps=_pcie_bw_gbps(speed, width),
-            ))
+            devices.append(
+                PcieDevice(
+                    address=addr,
+                    description=f"{vendor} {device_name}".strip(),
+                    numa_node=_pcie_numa_node(addr),
+                    link_speed=speed or "—",
+                    link_width=width,
+                    max_bw_gbps=_pcie_bw_gbps(speed, width),
+                )
+            )
 
         current = {}
 
@@ -368,10 +427,12 @@ def collect_pcie_devices() -> List[PcieDevice]:
 # Redis container management
 # ---------------------------------------------------------------------------
 
+
 def _redis_container_running(container: str) -> bool:
     r = subprocess.run(
         ["docker", "inspect", "--format={{.State.Running}}", container],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     return r.returncode == 0 and r.stdout.strip() == "true"
 
@@ -397,8 +458,12 @@ def start_redis_container(
     # --network=host: container shares the host network stack directly,
     # eliminating the Docker bridge veth overhead present with -p port mapping.
     cmd = [
-        "docker", "run", "--detach", "--rm",
-        "--name", container,
+        "docker",
+        "run",
+        "--detach",
+        "--rm",
+        "--name",
+        container,
         "--network=host",
     ]
 
@@ -411,8 +476,14 @@ def start_redis_container(
 
     cmd += [
         "redis:7-alpine",
-        "--io-threads", str(io_threads),
-        "--io-threads-do-reads", "yes",
+        "--io-threads",
+        str(io_threads),
+        "--io-threads-do-reads",
+        "yes",
+        # Disable output-buffer soft/hard limits for normal clients so that large
+        # GET replies (2MB+) are never truncated or disconnected mid-transfer.
+        "--client-output-buffer-limit",
+        "normal 0 0 0",
     ]
 
     print(f"  $ {' '.join(cmd)}", file=sys.stderr)
@@ -424,7 +495,8 @@ def start_redis_container(
     for _ in range(30):
         ping = subprocess.run(
             ["docker", "exec", container, "redis-cli", "-p", str(port), "PING"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if ping.stdout.strip() == "PONG":
             numa_label = f"node {numa_node}" if numa_node >= 0 else "any node"
@@ -446,6 +518,7 @@ def stop_redis_container(container: str) -> None:
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class BenchResult:
@@ -483,6 +556,7 @@ class ServerInfo:
 # ---------------------------------------------------------------------------
 # System information collection
 # ---------------------------------------------------------------------------
+
 
 def _cmd(cmd: str) -> str:
     try:
@@ -552,6 +626,7 @@ def collect_server_info() -> ServerInfo:
 # Benchmark runner
 # ---------------------------------------------------------------------------
 
+
 def _bench_env(
     redis_host: str,
     redis_port: int,
@@ -601,11 +676,13 @@ def _run_one(
 
     bench_cmd = [
         str(nixlbench),
-        "--backend=REDIS", "--runtime_type=ASIO",
+        "--backend=REDIS",
+        "--runtime_type=ASIO",
         f"--op_type={op}",
         f"--start_block_size={block_size_b}",
         f"--max_block_size={block_size_b}",
-        "--start_batch_size=1", "--max_batch_size=1",
+        "--start_batch_size=1",
+        "--max_batch_size=1",
         "--pipeline_depth=1",
         f"--num_threads={num_threads}",
         f"--total_buffer_size={total_buffer_size}",
@@ -620,9 +697,7 @@ def _run_one(
     cmd = numactl_prefix(numa_node) + bench_cmd
 
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, env=env, timeout=300
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
         output = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired:
         print("  TIMEOUT", file=sys.stderr)
@@ -633,7 +708,11 @@ def _run_one(
 
     if proc.returncode != 0:
         err = next(
-            (l for l in output.splitlines() if "ERROR" in l or "failed" in l.lower()),
+            (
+                line
+                for line in output.splitlines()
+                if "ERROR" in line or "failed" in line.lower()
+            ),
             output.splitlines()[-1] if output.splitlines() else "unknown",
         )
         print(f"  FAIL: {err}", file=sys.stderr)
@@ -646,10 +725,17 @@ def _run_one(
 
     bw, avg_lat, avg_prep, p99_prep, avg_post, p99_post, avg_tx, p99_tx = parsed
     return BenchResult(
-        op=op, block_size_b=block_size_b, num_threads=num_threads,
-        bw_gbps=bw, avg_lat_us=avg_lat, avg_tx_us=avg_tx, p99_tx_us=p99_tx,
-        avg_prep_us=avg_prep, p99_prep_us=p99_prep,
-        avg_post_us=avg_post, p99_post_us=p99_post,
+        op=op,
+        block_size_b=block_size_b,
+        num_threads=num_threads,
+        bw_gbps=bw,
+        avg_lat_us=avg_lat,
+        avg_tx_us=avg_tx,
+        p99_tx_us=p99_tx,
+        avg_prep_us=avg_prep,
+        p99_prep_us=p99_prep,
+        avg_post_us=avg_post,
+        p99_post_us=p99_post,
     )
 
 
@@ -672,15 +758,27 @@ def run_all(
                 done += 1
                 print(
                     f"  [{done:2d}/{total}] {op:5s} {bs_kb:4d} KB  {nt:2d}T ... ",
-                    end="", flush=True, file=sys.stderr,
+                    end="",
+                    flush=True,
+                    file=sys.stderr,
                 )
                 r = _run_one(
-                    nixlbench, op, bs_b, nt, env,
-                    warmup_iter, num_iter, total_buffer_size, numa_node,
+                    nixlbench,
+                    op,
+                    bs_b,
+                    nt,
+                    env,
+                    warmup_iter,
+                    num_iter,
+                    total_buffer_size,
+                    numa_node,
                 )
                 if r:
                     results.append(r)
-                    print(f"{r.bw_gbps:.3f} GB/s  avg {r.avg_tx_us:.0f} µs", file=sys.stderr)
+                    print(
+                        f"{r.bw_gbps:.3f} GB/s  avg {r.avg_tx_us:.0f} µs",
+                        file=sys.stderr,
+                    )
                 else:
                     print("SKIPPED", file=sys.stderr)
 
@@ -707,7 +805,9 @@ def _bw_table(op: str, idx: _Index) -> str:
     sep = "|:----------:|" + "|:---------:|" * len(THREAD_COUNTS)
     rows = [hdr, sep]
     for bs_kb in BLOCK_SIZES_KB:
-        cells = [f"{bs_kb} KB"] + [_bw(idx.get((op, bs_kb * 1024, t))) for t in THREAD_COUNTS]
+        cells = [f"{bs_kb} KB"] + [
+            _bw(idx.get((op, bs_kb * 1024, t))) for t in THREAD_COUNTS
+        ]
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
@@ -717,7 +817,9 @@ def _lat_table(op: str, idx: _Index, attr: str, label: str) -> str:
     sep = "|:----------:|" + "|:-----------:|" * len(THREAD_COUNTS)
     rows = [hdr, sep]
     for bs_kb in BLOCK_SIZES_KB:
-        cells = [f"{bs_kb} KB"] + [_lat(idx.get((op, bs_kb * 1024, t)), attr) for t in THREAD_COUNTS]
+        cells = [f"{bs_kb} KB"] + [
+            _lat(idx.get((op, bs_kb * 1024, t)), attr) for t in THREAD_COUNTS
+        ]
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
@@ -749,7 +851,6 @@ def render_report(
     idx: _Index = {(r.op, r.block_size_b, r.num_threads): r for r in results}
     L: List[str] = []
 
-    numa_label = f"node {numa_node}" if numa_node >= 0 else "not pinned"
     if numa_node >= 0:
         cpulist = numa_node_cpulist(numa_node)
         total_kib = numa_node_total_kib(numa_node)
@@ -757,7 +858,11 @@ def render_report(
         numa_detail = (
             f"node {numa_node}"
             + (f"  CPUs: {cpulist}" if cpulist else "")
-            + (f"  Mem: {free_kib//1024//1024:.1f}/{total_kib//1024//1024:.1f} GiB free" if total_kib else "")
+            + (
+                f"  Mem: {free_kib // 1024 // 1024:.1f}/{total_kib // 1024 // 1024:.1f} GiB free"
+                if total_kib
+                else ""
+            )
         )
     else:
         numa_detail = "not pinned"
@@ -797,8 +902,8 @@ def render_report(
         marker = " ← benchmark" if n == numa_node else ""
         numa_mem_rows.append(
             f"| {n}{marker} | {cpulist} "
-            f"| {total_kib//1024//1024:.1f} GiB "
-            f"| {free_kib//1024//1024:.1f} GiB |"
+            f"| {total_kib // 1024 // 1024:.1f} GiB "
+            f"| {free_kib // 1024 // 1024:.1f} GiB |"
         )
 
     L += [
@@ -889,14 +994,22 @@ def render_report(
         "|:----------|:----------:|:-------:|:----------:|:-----------:|:-----------:|",
     ]
     for op in OPERATIONS:
-        best = max((r for r in results if r.op == op), key=lambda r: r.bw_gbps, default=None)
+        best = max(
+            (r for r in results if r.op == op), key=lambda r: r.bw_gbps, default=None
+        )
         if best:
             L.append(
                 f"| {op} | {best.block_size_b // 1024} KB | {best.num_threads}T"
                 f" | {best.bw_gbps:.3f} | {best.avg_tx_us:.0f} | {best.p99_tx_us:.0f} |"
             )
 
-    L += ["", "---", "", "_Report generated by `test/python/test_redis_benchmark.py`_", ""]
+    L += [
+        "",
+        "---",
+        "",
+        "_Report generated by `test/python/test_redis_benchmark.py`_",
+        "",
+    ]
     return "\n".join(L)
 
 
@@ -904,11 +1017,13 @@ def render_report(
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="NIXL Redis end-to-end nixlbench sweep → Markdown report",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
+        epilog=textwrap.dedent(
+            """\
             Examples:
               # First run: builds everything, starts Redis, benchmarks, stops Redis
               python3 test/python/test_redis_benchmark.py
@@ -927,46 +1042,61 @@ def parse_args() -> argparse.Namespace:
 
               # Skip build entirely (use existing binaries)
               python3 test/python/test_redis_benchmark.py --skip-build
-        """),
+        """
+        ),
     )
     p.add_argument(
-        "--bench-dir", default="/tmp/nixl-redis-bench",
+        "--bench-dir",
+        default="/tmp/nixl-redis-bench",
         help="Persistent root for build and install directories",
     )
     p.add_argument(
-        "--rebuild", action="store_true",
+        "--rebuild",
+        action="store_true",
         help="Wipe and recreate build directories before building",
     )
     p.add_argument(
-        "--skip-build", action="store_true",
+        "--skip-build",
+        action="store_true",
         help="Skip the build phase and use existing binaries in --bench-dir",
     )
     p.add_argument(
-        "--start-redis", default=True, action=argparse.BooleanOptionalAction,
+        "--start-redis",
+        default=True,
+        action=argparse.BooleanOptionalAction,
         help="Start (and stop) a Redis Docker container for the benchmark (default: on)",
     )
     p.add_argument(
-        "--redis-container", default="nixl-redis-bench",
+        "--redis-container",
+        default="nixl-redis-bench",
         help="Docker container name for the managed Redis instance",
     )
     p.add_argument(
-        "--redis-io-threads", type=int, default=4,
-        help="Redis --io-threads value (default: 4)",
+        "--redis-io-threads",
+        type=int,
+        default=0,
+        help="Redis --io-threads value (0 = auto: physical cores on the chosen NUMA node, capped at 16)",
     )
     p.add_argument("--redis-host", default="127.0.0.1")
     p.add_argument("--redis-port", type=int, default=6379)
     p.add_argument("--redis-pool-size", type=int, default=8)
     p.add_argument(
-        "--numa-node", type=int, default=-1,
+        "--numa-node",
+        type=int,
+        default=-1,
         help="NUMA node to pin Redis container and nixlbench to (-1 = auto-detect best node)",
     )
     p.add_argument("--warmup-iter", type=int, default=32)
     p.add_argument("--num-iter", type=int, default=208)
     p.add_argument(
-        "--total-buffer-size", type=int, default=67108864,
+        "--total-buffer-size",
+        type=int,
+        default=67108864,
         help="Total buffer size in bytes (default: 64 MiB)",
     )
-    p.add_argument("--output", default=None, help="Write Markdown report to file (default: stdout)")
+    p.add_argument(
+        "--output", default=None, help="Write Markdown report to file (default: stdout)"
+    )
     return p.parse_args()
 
 
@@ -981,25 +1111,56 @@ def main() -> None:
     if args.skip_build:
         print("Build phase skipped (--skip-build).", file=sys.stderr)
         if not nixlbench_bin.is_file():
-            sys.exit(f"ERROR: nixlbench not found at {nixlbench_bin}. Run without --skip-build first.")
+            sys.exit(
+                f"ERROR: nixlbench not found at {nixlbench_bin}. Run without --skip-build first."
+            )
     else:
-        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"\n{'=' * 60}", file=sys.stderr)
         print(f"Build phase  (bench-dir: {bench_dir})", file=sys.stderr)
-        print(f"{'='*60}\n", file=sys.stderr)
+        print(f"{'=' * 60}\n", file=sys.stderr)
         nixlbench_bin, nixl_install_dir = ensure_built(bench_dir, rebuild=args.rebuild)
         print(f"\nBuild complete. nixlbench: {nixlbench_bin}\n", file=sys.stderr)
 
-    # NUMA selection
+    # NUMA selection — prefer the node with the most total memory (bandwidth proxy)
     if args.numa_node < 0:
         numa_node = detect_best_numa_node()
         print(
             f"NUMA auto-detect: selected node {numa_node} "
-            f"({numa_node_free_kib(numa_node) // 1024 // 1024:.1f} GiB free)",
+            f"(total {numa_node_total_kib(numa_node) // 1024 // 1024:.1f} GiB, "
+            f"{numa_node_free_kib(numa_node) // 1024 // 1024:.1f} GiB free, "
+            f"{numa_node_cpu_count(numa_node)} logical CPUs)",
             file=sys.stderr,
         )
     else:
         numa_node = args.numa_node
-        print(f"NUMA: using node {numa_node} (--numa-node)", file=sys.stderr)
+        print(
+            f"NUMA: using node {numa_node} (--numa-node, "
+            f"{numa_node_cpu_count(numa_node)} logical CPUs)",
+            file=sys.stderr,
+        )
+
+    # io-threads auto-detection: physical cores on the NUMA node, capped at 16
+    # (Redis io-threads beyond the physical core count add contention, not throughput)
+    if args.redis_io_threads <= 0:
+        logical = numa_node_cpu_count(numa_node)
+        # Assume 2 hyperthreads per core; fall back to logical count if lscpu unavailable
+        ht_per_core = 2
+        try:
+            lscpu_out = subprocess.run(
+                ["lscpu"], capture_output=True, text=True, timeout=5
+            ).stdout
+            m = re.search(r"Thread\(s\) per core:\s*(\d+)", lscpu_out)
+            if m:
+                ht_per_core = max(int(m.group(1)), 1)
+        except Exception:
+            pass
+        physical = max(logical // ht_per_core, 1)
+        args.redis_io_threads = min(physical, 16)
+        print(
+            f"io-threads auto-detect: {logical} logical CPUs / {ht_per_core} threads-per-core"
+            f" → {args.redis_io_threads} io-threads",
+            file=sys.stderr,
+        )
 
     numactl_avail = bool(shutil.which("numactl"))
     if not numactl_avail:
@@ -1012,9 +1173,9 @@ def main() -> None:
     # Redis phase
     we_started_redis = False
     if args.start_redis:
-        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"\n{'=' * 60}", file=sys.stderr)
         print("Redis phase", file=sys.stderr)
-        print(f"{'='*60}\n", file=sys.stderr)
+        print(f"{'=' * 60}\n", file=sys.stderr)
         we_started_redis = start_redis_container(
             args.redis_container,
             args.redis_port,
@@ -1028,27 +1189,35 @@ def main() -> None:
         info = collect_server_info()
 
         # Build runtime environment
-        env = _bench_env(args.redis_host, args.redis_port, args.redis_pool_size, nixl_install_dir)
+        env = _bench_env(
+            args.redis_host, args.redis_port, args.redis_pool_size, nixl_install_dir
+        )
 
         # Benchmark phase
         total_runs = len(OPERATIONS) * len(BLOCK_SIZES_KB) * len(THREAD_COUNTS)
-        print(f"\n{'='*60}", file=sys.stderr)
+        print(f"\n{'=' * 60}", file=sys.stderr)
         print(
             f"Benchmark phase  ({total_runs} runs: "
             f"{len(OPERATIONS)} ops × {len(BLOCK_SIZES_KB)} block sizes × {len(THREAD_COUNTS)} threads)",
             file=sys.stderr,
         )
-        print(f"{'='*60}\n", file=sys.stderr)
+        print(f"{'=' * 60}\n", file=sys.stderr)
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         results = run_all(
-            nixlbench_bin, env,
-            args.warmup_iter, args.num_iter, args.total_buffer_size,
+            nixlbench_bin,
+            env,
+            args.warmup_iter,
+            args.num_iter,
+            args.total_buffer_size,
             numa_node if numactl_avail else -1,
         )
 
         # Report phase
-        print(f"\nGenerating report ({len(results)}/{total_runs} runs succeeded) ...\n", file=sys.stderr)
+        print(
+            f"\nGenerating report ({len(results)}/{total_runs} runs succeeded) ...\n",
+            file=sys.stderr,
+        )
         report = render_report(results, info, args, bench_dir, timestamp, numa_node)
 
         if args.output:
@@ -1059,9 +1228,9 @@ def main() -> None:
 
     finally:
         if we_started_redis:
-            print(f"\n{'='*60}", file=sys.stderr)
+            print(f"\n{'=' * 60}", file=sys.stderr)
             print("Teardown phase", file=sys.stderr)
-            print(f"{'='*60}\n", file=sys.stderr)
+            print(f"{'=' * 60}\n", file=sys.stderr)
             stop_redis_container(args.redis_container)
 
 
