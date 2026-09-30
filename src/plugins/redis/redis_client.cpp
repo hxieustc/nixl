@@ -121,15 +121,27 @@ struct CallbackContext {
 
 } // namespace
 
-// Slot: one async TCP connection on the shared event loop.
-struct RedisConnectionPool::Slot {
-    RedisConnectionPool *pool = nullptr;
+struct RedisConnectionPool::SubConn {
+    RedisConnectionPool::Slot *slot = nullptr;
+    int idx = 0;
     redisAsyncContext *asyncCtx = nullptr;
     std::atomic<bool> connected{false};
+};
+
+// Slot: one libevent thread serving kConns pipelined async TCP connections.
+struct RedisConnectionPool::Slot {
+    static constexpr int kConns = 2;
+
+    RedisConnectionPool *pool = nullptr;
+    RedisConnectionPool::SubConn subconns[kConns];
+    std::atomic<int> initCount{0};
+    std::atomic<int> initOkCount{0};
     std::atomic<bool> initDone{false};
     std::atomic<bool> initSucceeded{false};
     std::atomic<int> inFlight{0};
-    // asyncCtx is freed by RedisConnectionPool::stopEventLoop on the event loop thread
+    std::atomic<int> nextConn{0};
+    event_base *eventBase = nullptr;
+    std::thread eventLoopThread;
 };
 
 RedisConnectionPool::RedisConnectionPool(RedisConfig config) : config_(std::move(config)) {
@@ -139,11 +151,6 @@ RedisConnectionPool::RedisConnectionPool(RedisConfig config) : config_(std::move
         }
     });
 
-    eventBase_ = event_base_new();
-    if (!eventBase_) {
-        throw std::runtime_error("Failed to create event base");
-    }
-
     const int N = config_.pool_size;
     slots_.reserve(N);
     for (int i = 0; i < N; ++i) {
@@ -151,28 +158,17 @@ RedisConnectionPool::RedisConnectionPool(RedisConfig config) : config_(std::move
         slots_.back()->pool = this;
     }
 
-    // Attach all async connections to the shared event base before starting the thread.
-    // On error, free whatever was created before re-throwing.
+    // Each slot gets its own event base and event loop thread so callbacks run in parallel.
+    // On error, stopEventLoop() cleans up whatever was successfully started.
     try {
         for (auto &s : slots_) {
             initSlotAsyncCtx(*s);
         }
     }
     catch (...) {
-        for (auto &s : slots_) {
-            if (s->asyncCtx) {
-                redisAsyncFree(s->asyncCtx);
-                s->asyncCtx = nullptr;
-            }
-        }
-        event_base_free(eventBase_);
-        eventBase_ = nullptr;
+        stopEventLoop();
         throw;
     }
-
-    // Start the single shared event loop thread.
-    // All N async connect/auth/select sequences run concurrently on this one thread.
-    eventLoopThread_ = std::thread([this]() { event_base_dispatch(eventBase_); });
 
     // Wait for every slot to complete initialization (parallel: ~1 RTT regardless of N).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -206,11 +202,13 @@ RedisConnectionPool::RedisConnectionPool(RedisConfig config) : config_(std::move
     }
 
     NIXL_INFO << absl::StrFormat(
-        "Redis connection pool ready: %d connections at %s:%d (db=%d, workers=%d)",
-        N,
+        "Redis connection pool ready: %d connections at %s:%d (db=%d, slots=%d, conns_per_slot=%d, workers=%d)",
+        N * Slot::kConns,
         config_.host,
         config_.port,
         config_.db,
+        N,
+        Slot::kConns,
         N);
 }
 
@@ -234,31 +232,55 @@ RedisConnectionPool::~RedisConnectionPool() {
 
 void
 RedisConnectionPool::initSlotAsyncCtx(Slot &slot) {
-    slot.asyncCtx = redisAsyncConnect(config_.host.c_str(), config_.port);
-    if (!slot.asyncCtx || slot.asyncCtx->err) {
-        std::string msg;
-        if (slot.asyncCtx) {
-            msg = absl::StrFormat("Failed to connect to Redis: %s", slot.asyncCtx->errstr);
-            redisAsyncFree(slot.asyncCtx);
-            slot.asyncCtx = nullptr;
-        } else {
-            msg = "Failed to allocate Redis async context";
+    slot.eventBase = event_base_new();
+    if (!slot.eventBase) {
+        throw std::runtime_error("Failed to create event base for slot");
+    }
+
+    for (int i = 0; i < Slot::kConns; ++i) {
+        SubConn &sc = slot.subconns[i];
+        sc.slot = &slot;
+        sc.idx = i;
+
+        sc.asyncCtx = redisAsyncConnect(config_.host.c_str(), config_.port);
+        if (!sc.asyncCtx || sc.asyncCtx->err) {
+            std::string msg = sc.asyncCtx ?
+                absl::StrFormat("Failed to connect to Redis: %s", sc.asyncCtx->errstr) :
+                "Failed to allocate Redis async context";
+            if (sc.asyncCtx) {
+                redisAsyncFree(sc.asyncCtx);
+                sc.asyncCtx = nullptr;
+            }
+            for (int j = 0; j < i; ++j) {
+                redisAsyncFree(slot.subconns[j].asyncCtx);
+                slot.subconns[j].asyncCtx = nullptr;
+            }
+            event_base_free(slot.eventBase);
+            slot.eventBase = nullptr;
+            throw std::runtime_error(msg);
         }
-        throw std::runtime_error(msg);
+
+        sc.asyncCtx->data = &sc;
+
+        if (redisLibeventAttach(sc.asyncCtx, slot.eventBase) != REDIS_OK) {
+            std::string msg =
+                absl::StrFormat("Failed to attach Redis to event base: %s", sc.asyncCtx->errstr);
+            redisAsyncFree(sc.asyncCtx);
+            sc.asyncCtx = nullptr;
+            for (int j = 0; j < i; ++j) {
+                redisAsyncFree(slot.subconns[j].asyncCtx);
+                slot.subconns[j].asyncCtx = nullptr;
+            }
+            event_base_free(slot.eventBase);
+            slot.eventBase = nullptr;
+            throw std::runtime_error(msg);
+        }
+
+        redisAsyncSetConnectCallback(sc.asyncCtx, connectCallback);
+        redisAsyncSetDisconnectCallback(sc.asyncCtx, disconnectCallback);
     }
 
-    slot.asyncCtx->data = &slot;
-
-    if (redisLibeventAttach(slot.asyncCtx, eventBase_) != REDIS_OK) {
-        std::string msg =
-            absl::StrFormat("Failed to attach Redis to event base: %s", slot.asyncCtx->errstr);
-        redisAsyncFree(slot.asyncCtx);
-        slot.asyncCtx = nullptr;
-        throw std::runtime_error(msg);
-    }
-
-    redisAsyncSetConnectCallback(slot.asyncCtx, connectCallback);
-    redisAsyncSetDisconnectCallback(slot.asyncCtx, disconnectCallback);
+    slot.eventLoopThread = std::thread([&slot]() { event_base_dispatch(slot.eventBase); });
 }
 
 void
@@ -345,13 +367,13 @@ RedisConnectionPool::postToWorker(std::function<void()> task) {
 }
 
 bool
-RedisConnectionPool::scheduleOnEventLoop(std::function<void()> task) {
-    if (!eventBase_) {
+RedisConnectionPool::scheduleOnSlot(Slot &slot, std::function<void()> task) {
+    if (!slot.eventBase) {
         return false;
     }
     auto *owned_task = new redis_event_task_t(std::move(task));
     timeval immediate = {0, 0};
-    if (event_base_once(eventBase_, -1, EV_TIMEOUT, runEventTask, owned_task, &immediate) != 0) {
+    if (event_base_once(slot.eventBase, -1, EV_TIMEOUT, runEventTask, owned_task, &immediate) != 0) {
         delete owned_task;
         return false;
     }
@@ -360,96 +382,92 @@ RedisConnectionPool::scheduleOnEventLoop(std::function<void()> task) {
 
 void
 RedisConnectionPool::stopEventLoop() {
-    if (!eventBase_) {
-        return;
-    }
-    if (eventLoopThread_.joinable()) {
-        bool scheduled = scheduleOnEventLoop([this]() {
-            for (auto &s : slots_) {
-                if (s->asyncCtx) {
-                    // Mark disconnected before freeing so concurrent
-                    // leastLoadedHealthySlot() callers stop routing here
-                    // before pending callbacks fire (slot still alive at this point).
-                    s->connected.store(false);
-                    redisAsyncFree(s->asyncCtx); // fires pending callbacks with null reply
-                    s->asyncCtx = nullptr;
+    for (auto &s : slots_) {
+        if (!s->eventBase) {
+            continue;
+        }
+        if (s->eventLoopThread.joinable()) {
+            Slot *sp = s.get();
+            bool scheduled = scheduleOnSlot(*s, [sp]() {
+                for (int i = 0; i < Slot::kConns; ++i) {
+                    SubConn &sc = sp->subconns[i];
+                    if (sc.asyncCtx) {
+                        sc.connected.store(false);
+                        redisAsyncFree(sc.asyncCtx);
+                        sc.asyncCtx = nullptr;
+                    }
                 }
+                event_base_loopbreak(sp->eventBase);
+            });
+            if (!scheduled) {
+                event_base_loopbreak(s->eventBase);
             }
-            // loopexit (vs loopbreak) lets any pending EV_TIMEOUT(0,0) tasks
-            // posted by concurrent putKeyAsync/getKeyAsync calls fire first,
-            // so their promises are resolved before the loop exits.
-            event_base_loopexit(eventBase_, nullptr);
-        });
-        if (!scheduled) {
-            event_base_loopbreak(eventBase_);
+            s->eventLoopThread.join();
         }
-        eventLoopThread_.join();
-        // Sweep: if the cleanup lambda didn't run (scheduling failure), free any
-        // remaining asyncCtx now that the event loop is stopped and no callbacks fire.
-        for (auto &s : slots_) {
-            if (s->asyncCtx) {
-                redisAsyncFree(s->asyncCtx);
-                s->asyncCtx = nullptr;
-            }
-        }
-    }
-    event_base_free(eventBase_);
-    eventBase_ = nullptr;
-}
-
-void
-RedisConnectionPool::freeSlotAsyncCtx(Slot &slot) {
-    if (slot.asyncCtx) {
-        redisAsyncFree(slot.asyncCtx);
-        slot.asyncCtx = nullptr;
+        event_base_free(s->eventBase);
+        s->eventBase = nullptr;
     }
 }
 
 void
-RedisConnectionPool::completeSlotInit(Slot &slot, bool success) {
-    slot.connected.store(success);
-    slot.initSucceeded.store(success);
-    slot.initDone.store(true);
+RedisConnectionPool::completeSubConnInit(SubConn &sc, bool success) {
+    if (success) {
+        sc.slot->initOkCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    sc.connected.store(success);
+    if (sc.slot->initCount.fetch_add(1, std::memory_order_acq_rel) + 1 == Slot::kConns) {
+        bool allOk = (sc.slot->initOkCount.load() == Slot::kConns);
+        sc.slot->initSucceeded.store(allOk);
+        sc.slot->initDone.store(true, std::memory_order_release);
+    }
 }
 
 void
-RedisConnectionPool::startSlotSelect(Slot &slot) {
+RedisConnectionPool::freeSubConnAsyncCtx(SubConn &sc) {
+    if (sc.asyncCtx) {
+        redisAsyncFree(sc.asyncCtx);
+        sc.asyncCtx = nullptr;
+    }
+}
+
+void
+RedisConnectionPool::startSubConnSelect(SubConn &sc) {
     if (config_.db == 0) {
-        completeSlotInit(slot, true);
+        completeSubConnInit(sc, true);
         return;
     }
-    int ret = redisAsyncCommand(slot.asyncCtx, selectCallback, &slot, "SELECT %d", config_.db);
+    int ret = redisAsyncCommand(sc.asyncCtx, selectCallback, &sc, "SELECT %d", config_.db);
     if (ret != REDIS_OK) {
         NIXL_ERROR << "Failed to queue Redis SELECT command";
-        completeSlotInit(slot, false);
-        freeSlotAsyncCtx(slot);
+        completeSubConnInit(sc, false);
+        freeSubConnAsyncCtx(sc);
     }
 }
 
 void
-RedisConnectionPool::startSlotAuth(Slot &slot) {
+RedisConnectionPool::startSubConnAuth(SubConn &sc) {
     if (config_.password.empty()) {
-        startSlotSelect(slot);
+        startSubConnSelect(sc);
         return;
     }
     const int ret = config_.username.empty() ?
-        redisAsyncCommand(slot.asyncCtx, authCallback, &slot, "AUTH %s", config_.password.c_str()) :
-        redisAsyncCommand(slot.asyncCtx,
+        redisAsyncCommand(sc.asyncCtx, authCallback, &sc, "AUTH %s", config_.password.c_str()) :
+        redisAsyncCommand(sc.asyncCtx,
                           authCallback,
-                          &slot,
+                          &sc,
                           "AUTH %s %s",
                           config_.username.c_str(),
                           config_.password.c_str());
     if (ret != REDIS_OK) {
         NIXL_ERROR << "Failed to queue Redis AUTH command";
-        completeSlotInit(slot, false);
-        freeSlotAsyncCtx(slot);
+        completeSubConnInit(sc, false);
+        freeSubConnAsyncCtx(sc);
     }
 }
 
 void
 RedisConnectionPool::connectCallback(const redisAsyncContext *c, int status) {
-    auto *slot = static_cast<Slot *>(c->data);
+    auto *sc = static_cast<SubConn *>(c->data);
     if (status != REDIS_OK) {
         NIXL_ERROR << absl::StrFormat("Redis connection error: %s", c->errstr);
         // hiredis frees c after this callback returns (REDIS_CONNECTED was never set,
@@ -458,13 +476,13 @@ RedisConnectionPool::connectCallback(const redisAsyncContext *c, int status) {
         slot->asyncCtx = nullptr;
         slot->pool->completeSlotInit(*slot, false);
     } else {
-        slot->pool->startSlotAuth(*slot);
+        sc->slot->pool->startSubConnAuth(*sc);
     }
 }
 
 void
 RedisConnectionPool::disconnectCallback(const redisAsyncContext *c, int status) {
-    auto *slot = static_cast<Slot *>(c->data);
+    auto *sc = static_cast<SubConn *>(c->data);
     if (status != REDIS_OK) {
         NIXL_WARN << absl::StrFormat("Redis disconnected with error: %s", c->errstr);
     }
@@ -476,7 +494,7 @@ RedisConnectionPool::disconnectCallback(const redisAsyncContext *c, int status) 
 
 void
 RedisConnectionPool::authCallback(redisAsyncContext *c, void *reply, void *privdata) {
-    auto *slot = static_cast<Slot *>(privdata);
+    auto *sc = static_cast<SubConn *>(privdata);
     auto *r = static_cast<redisReply *>(reply);
     if (!checkRedisReplyOk(r, "AUTH")) {
         slot->pool->completeSlotInit(*slot, false);
@@ -490,12 +508,12 @@ RedisConnectionPool::authCallback(redisAsyncContext *c, void *reply, void *privd
         }
         return;
     }
-    slot->pool->startSlotSelect(*slot);
+    sc->slot->pool->startSubConnSelect(*sc);
 }
 
 void
 RedisConnectionPool::selectCallback(redisAsyncContext *c, void *reply, void *privdata) {
-    auto *slot = static_cast<Slot *>(privdata);
+    auto *sc = static_cast<SubConn *>(privdata);
     auto *r = static_cast<redisReply *>(reply);
     if (!checkRedisReplyOk(r, "SELECT")) {
         slot->pool->completeSlotInit(*slot, false);
@@ -506,7 +524,7 @@ RedisConnectionPool::selectCallback(redisAsyncContext *c, void *reply, void *pri
         }
         return;
     }
-    slot->pool->completeSlotInit(*slot, true);
+    sc->slot->pool->completeSubConnInit(*sc, true);
 }
 
 void
@@ -571,10 +589,10 @@ RedisConnectionPool::getCallback(redisAsyncContext *c, void *reply, void *privda
             } else {
                 // Steal the reply buffer so the large memcpy runs on a worker thread
                 // without blocking the event loop. hiredis skips free() for null str.
-                auto *slot = static_cast<Slot *>(c->data);
+                auto *sc = static_cast<SubConn *>(c->data);
                 char *str = r->str;
                 r->str = nullptr;
-                slot->pool->postToWorker([str, dst, len, promise, inFlight]() {
+                sc->slot->pool->postToWorker([str, dst, len, promise, inFlight]() {
                     std::memcpy(reinterpret_cast<void *>(dst), str, len);
                     hi_free(str);
                     if (inFlight) {
@@ -631,7 +649,14 @@ RedisConnectionPool::Slot *
 RedisConnectionPool::leastLoadedHealthySlot() {
     Slot *best = nullptr;
     for (auto &s : slots_) {
-        if (!s->connected.load()) {
+        bool any = false;
+        for (int i = 0; i < Slot::kConns; ++i) {
+            if (s->subconns[i].connected.load()) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
             continue;
         }
         if (!best ||
@@ -659,9 +684,16 @@ RedisConnectionPool::putKeyAsync(std::string_view key,
     slot->inFlight.fetch_add(1, std::memory_order_relaxed);
 
     std::string key_copy(key);
-    const bool scheduled = scheduleOnEventLoop(
+    const bool scheduled = scheduleOnSlot(
+        *slot,
         [slot, key = std::move(key_copy), data_ptr, data_len, promise]() mutable {
-            if (!slot->connected.load() || !slot->asyncCtx) {
+            int next =
+                slot->nextConn.fetch_add(1, std::memory_order_relaxed) % Slot::kConns;
+            SubConn *sc = &slot->subconns[next];
+            if (!sc->connected.load() || !sc->asyncCtx) {
+                sc = &slot->subconns[(next + 1) % Slot::kConns];
+            }
+            if (!sc->connected.load() || !sc->asyncCtx) {
                 slot->inFlight.fetch_sub(1, std::memory_order_relaxed);
                 if (promise) {
                     promise->set_value(NIXL_ERR_BACKEND);
@@ -675,7 +707,7 @@ RedisConnectionPool::putKeyAsync(std::string_view key,
             ctx->promise_ptr = promise;
             ctx->inFlight = &slot->inFlight;
 
-            const int ret = redisAsyncCommand(slot->asyncCtx,
+            const int ret = redisAsyncCommand(sc->asyncCtx,
                                               setCallback,
                                               ctx,
                                               "SET %b %b",
@@ -717,9 +749,16 @@ RedisConnectionPool::getKeyAsync(std::string_view key,
     slot->inFlight.fetch_add(1, std::memory_order_relaxed);
 
     std::string key_copy(key);
-    const bool scheduled = scheduleOnEventLoop(
+    const bool scheduled = scheduleOnSlot(
+        *slot,
         [slot, key = std::move(key_copy), data_ptr, data_len, promise]() mutable {
-            if (!slot->connected.load() || !slot->asyncCtx) {
+            int next =
+                slot->nextConn.fetch_add(1, std::memory_order_relaxed) % Slot::kConns;
+            SubConn *sc = &slot->subconns[next];
+            if (!sc->connected.load() || !sc->asyncCtx) {
+                sc = &slot->subconns[(next + 1) % Slot::kConns];
+            }
+            if (!sc->connected.load() || !sc->asyncCtx) {
                 slot->inFlight.fetch_sub(1, std::memory_order_relaxed);
                 if (promise) {
                     promise->set_value(NIXL_ERR_BACKEND);
@@ -733,8 +772,8 @@ RedisConnectionPool::getKeyAsync(std::string_view key,
             ctx->promise_ptr = promise;
             ctx->inFlight = &slot->inFlight;
 
-            const int ret = redisAsyncCommand(
-                slot->asyncCtx, getCallback, ctx, "GET %b", key.data(), key.size());
+            const int ret =
+                redisAsyncCommand(sc->asyncCtx, getCallback, ctx, "GET %b", key.data(), key.size());
             if (ret != REDIS_OK) {
                 slot->inFlight.fetch_sub(1, std::memory_order_relaxed);
                 auto p = ctx->promise_ptr;
