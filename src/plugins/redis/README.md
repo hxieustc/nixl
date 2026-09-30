@@ -27,19 +27,141 @@ src/plugins/redis/
 interface isolates hiredis/libevent and permits Redis-free unit tests; it is not a generic KV
 extension API.
 
-The production client uses a `RedisConnectionPool` (default: 8 connections). All connections
-share one libevent event loop thread. Each connection slot holds one hiredis/libevent async
-connection for `SET` and `GET`. A single shared blocking hiredis connection handles `EXISTS`
-for all slots; `queryMem` calls EXISTS serially, so one connection is sufficient.
+The production client uses a `RedisConnectionPool` (default: pool_size=8).
+Each *slot* owns two pipelined hiredis/libevent async connections sharing one dedicated
+libevent event loop thread — so a pool of size N creates 2N async TCP connections and N
+event loop threads. Commands are distributed round-robin across the two connections within
+the chosen slot to halve per-connection queue depth. A single shared blocking hiredis
+connection handles `EXISTS` for all slots; `queryMem` calls EXISTS serially, so one
+connection is sufficient.
 
-Resource cost: **1 OS thread** + N async TCP connections + 1 sync TCP connection for a pool
-of size N. A single hiredis async connection already pipelines many outstanding commands, so
-increasing pool size helps primarily when the Redis server runs with `--io-threads` and
-multiple connections saturate more server threads. Decrease pool size to 1 for
-memory-constrained environments.
+Resource cost: **(2N + 1) OS threads** + 2N async TCP connections + 1 sync TCP connection
+for a pool of size N. Increasing pool size helps when the Redis server runs with
+`--io-threads` and multiple connections saturate more server threads. Decrease pool size to
+1 for memory-constrained environments.
 
 Operations are dispatched to the healthy slot with the fewest in-flight async commands
 (least-connection routing). Commands fail immediately if all slots are disconnected.
+
+GET reply buffers for payloads > 512 KB are handed off to a worker pool (N threads) so
+that large memcpy calls do not block the event loop threads. For payloads ≤ 512 KB the
+copy is performed inline on the event loop thread because the worker dispatch overhead
+(mutex + condition variable) exceeds the copy cost.
+
+## Performance
+
+### Benchmark setup
+
+Measurements were taken on a dual-socket Intel Xeon Gold 6438Y+ (32 cores / 2 threads per
+core, 4 GHz) with both the Redis server (Docker, host networking, 16 io-threads) and the
+NIXL benchmark process pinned to the same NUMA node. All numbers are loopback TCP;
+no NIC is involved. Total buffer: 64 MiB. Warmup: 32 iterations; measured: 208 iterations.
+
+Notation: **bs** = batch size (descriptors per `postXfer` call), **T** = thread count,
+**pool** = `pool_size`.
+
+### Optimization history
+
+Three successive optimizations were applied to the original single-loop, single-connection
+implementation. Each is described below with its measured impact.
+
+---
+
+#### Fix 1 — Inline memcpy for GET replies ≤ 512 KB
+
+**What changed.** Previously every GET reply was handed to the N-thread worker pool for
+the `memcpy` regardless of payload size. The mutex + condition-variable round-trip cost
+(~7 µs each way) dominated small transfers. Fix 1 copies payloads ≤ 512 KB directly on
+the event loop thread and only dispatches to the worker pool for larger blocks.
+
+**Threshold rationale.** 512 KB at ~20 GB/s DRAM bandwidth costs ≈ 25 µs — acceptable
+blocking time for one callback cycle. Larger blocks would stall the event loop long enough
+to delay other pending callbacks.
+
+**Measured impact at 128 KB READ, bs=16, 4T, pool=8.**
+
+| Before Fix 1 | After Fix 1 |
+|:---:|:---:|
+| 1.35 GB/s | **2.69 GB/s** (+99%) |
+
+Fix 1 also eliminates the per-callback mutex overhead for all block sizes ≤ 512 KB on
+the READ path. The WRITE path is unaffected (SET callbacks copy no data).
+
+---
+
+#### Option A — One dedicated event loop thread per slot
+
+**What changed.** The original pool used a single `event_base` shared across all N async
+connections, so every `getCallback` and `setCallback` serialized on one thread. Option A
+gives each slot its own `event_base` and a dedicated OS thread (`event_base_dispatch`).
+Callbacks for different slots now run truly in parallel.
+
+With N = 8 and bs = 16, 4T issues 64 concurrent GETs spread evenly across 8 slots. Each
+event loop thread handles 8 callbacks independently instead of all 64 serializing.
+
+**Measured impact at 128 KB READ, bs=16, 4T, pool=8.**
+
+| Fix 1 baseline | + Option A |
+|:---:|:---:|
+| 2.69 GB/s | **3.48 GB/s** (+29%) |
+
+Throughput at bs=8 and bs=16 improves most because those configurations create the most
+contention on the shared event loop.
+
+---
+
+#### Option B — Two async connections per slot
+
+**What changed.** Each slot now owns two pipelined async TCP connections instead of one
+(`kConns = 2`). Both connections share the slot's event loop thread. Dispatch round-robins
+between them, halving per-connection queue depth from `(T × bs) / N` to `(T × bs) / 2N`.
+This matches the connection count of the original "2N" design.
+
+**Measured impact at 128 KB READ, bs=16, 4T, pool=8.**
+
+| Fix 1 baseline | + Option A | + Option A + B |
+|:---:|:---:|:---:|
+| 2.69 GB/s | 3.48 GB/s | **3.71 GB/s** (+38% vs baseline) |
+
+Option B contributes a modest additional +7% on top of Option A because the dominant
+bottleneck at 128 KB has shifted from connection queue depth to per-callback inline memcpy
+serialization within each event loop thread.
+
+---
+
+### Representative results (Option A + B)
+
+All numbers from the final implementation with default `pool_size=8`.
+
+#### WRITE throughput (GB/s)
+
+| Block (KB) | bs=1, 4T | bs=4, 4T | bs=8, 4T | bs=16, 4T | bs=8, 8T | bs=16, 8T |
+|:----------:|:--------:|:--------:|:--------:|:---------:|:--------:|:---------:|
+| 128 | 1.50 | 2.15 | 3.02 | 3.62 | 3.68 | 4.08 |
+| 256 | 1.70 | 3.35 | 5.44 | — | 7.12 | — |
+| 512 | 1.94 | 5.72 | 5.93 | 7.02 | 7.43 | 4.77 |
+| 1024 | 2.72 | 4.23 | 4.27 | 5.93 | 5.34 | 4.61 |
+
+WRITE throughput exceeds 7 GB/s for 256 KB and 512 KB at bs ≥ 8 with 8 threads.
+At 512 KB bs=16 the pool is back-pressured by the Redis server buffer limit, causing
+a throughput dip; reducing bs or pool_size recovers bandwidth.
+
+#### READ throughput (GB/s)
+
+| Block (KB) | bs=1, 4T | bs=4, 4T | bs=8, 4T | bs=16, 4T | bs=8, 8T | bs=16, 8T |
+|:----------:|:--------:|:--------:|:--------:|:---------:|:--------:|:---------:|
+| 128 | 2.25 | 1.92 | 2.48 | 3.71 | 2.46 | 3.35 |
+| 256 | 2.33 | 2.73 | 2.92 | 2.74 | 2.67 | 2.55 |
+| 512 | 2.94 | 3.12 | 2.78 | 2.59 | 2.49 | 2.43 |
+| 1024 | 2.67 | 2.47 | 3.16 | 2.41 | 2.75 | 2.65 |
+
+READ throughput is lower than WRITE because `getCallback` performs an inline memcpy for
+every reply ≤ 512 KB, serializing within each event loop thread. At 128 KB the memcpy
+cost per callback (≈ 6–7 µs) is small; higher batch sizes amortize scheduling overhead
+and reach 3.7 GB/s. At 256 KB and above the memcpy cost grows proportionally and limits
+per-slot throughput to ≈ 2.5–3 GB/s regardless of pool configuration.
+
+---
 
 ## Dependencies
 
