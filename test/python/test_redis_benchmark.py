@@ -8,7 +8,7 @@ NIXL Redis Plugin — end-to-end nixlbench performance benchmark script.
 Builds NIXL (with static REDIS plugin) and nixlbench into a persistent
 directory, optionally starts a Redis container with host networking and
 io-threads enabled, pins both Redis and nixlbench to the same NUMA node,
-runs a full WRITE/READ sweep across block sizes and thread counts, and emits
+runs a full WRITE/READ sweep across block sizes, batch sizes, and thread counts, and emits
 a Markdown report with results tables, server info, and PCIe link speeds.
 
 The build directory is persistent across runs: a second invocation reuses
@@ -26,7 +26,7 @@ Options:
     --redis-io-threads N    Redis --io-threads value  [default: auto = physical cores on NUMA node, ≤16]
     --redis-host HOST       Redis host  [default: 127.0.0.1]
     --redis-port PORT       Redis port  [default: 6379]
-    --redis-pool-size N     REDIS_POOL_SIZE passed to the plugin  [default: 8]
+    --redis-pool-size       (swept automatically over [2, 4, 8, 16])
     --numa-node N           NUMA node to pin Redis and nixlbench to (-1 = auto)  [default: -1]
     --warmup-iter N         Warmup iterations per run  [default: 32]
     --num-iter N            Measured iterations per run  [default: 208]
@@ -63,8 +63,10 @@ NIXLBENCH_SRC = REPO_ROOT / "benchmark" / "nixlbench"
 # Benchmark matrix
 # ---------------------------------------------------------------------------
 
-BLOCK_SIZES_KB = [128, 256, 512, 1024, 2048, 4096]
-THREAD_COUNTS = [1, 4, 8, 16]
+BLOCK_SIZES_KB = [128, 256, 512]
+THREAD_COUNTS = [4, 8]
+BATCH_SIZES = [1, 2, 4, 8, 16]
+POOL_SIZES = [8, 16, 32]
 OPERATIONS = ["WRITE", "READ"]
 
 # ---------------------------------------------------------------------------
@@ -525,6 +527,8 @@ class BenchResult:
     op: str
     block_size_b: int
     num_threads: int
+    batch_size: int
+    pool_size: int
     bw_gbps: float
     avg_lat_us: float
     avg_tx_us: float
@@ -630,13 +634,11 @@ def collect_server_info() -> ServerInfo:
 def _bench_env(
     redis_host: str,
     redis_port: int,
-    redis_pool_size: int,
     nixl_install_dir: Path,
 ) -> Dict[str, str]:
     env = os.environ.copy()
     env["REDIS_HOST"] = redis_host
     env["REDIS_PORT"] = str(redis_port)
-    env["REDIS_POOL_SIZE"] = str(redis_pool_size)
     arch = platform.machine()
     lib_dir = nixl_install_dir / "lib" / f"{arch}-linux-gnu"
     existing = env.get("LD_LIBRARY_PATH", "")
@@ -660,6 +662,8 @@ def _run_one(
     op: str,
     block_size_b: int,
     num_threads: int,
+    batch_size: int,
+    pool_size: int,
     env: Dict[str, str],
     warmup_iter: int,
     num_iter: int,
@@ -667,6 +671,7 @@ def _run_one(
     numa_node: int,
 ) -> Optional[BenchResult]:
     effective_iter = max(num_threads, (num_iter // num_threads) * num_threads)
+    env = {**env, "REDIS_POOL_SIZE": str(pool_size)}
 
     # nixlbench's WRITE consistency check (GET-after-SET) does not work
     # correctly with num_threads > 1: the checker looks for a neighbouring
@@ -681,11 +686,11 @@ def _run_one(
         f"--op_type={op}",
         f"--start_block_size={block_size_b}",
         f"--max_block_size={block_size_b}",
-        "--start_batch_size=1",
-        "--max_batch_size=1",
+        f"--start_batch_size={batch_size}",
+        f"--max_batch_size={batch_size}",
         "--pipeline_depth=1",
         f"--num_threads={num_threads}",
-        f"--total_buffer_size={total_buffer_size}",
+        f"--total_buffer_size={max(total_buffer_size, block_size_b * batch_size * num_threads)}",
         f"--warmup_iter={warmup_iter}",
         f"--num_iter={effective_iter}",
         f"--check_consistency={check}",
@@ -728,6 +733,8 @@ def _run_one(
         op=op,
         block_size_b=block_size_b,
         num_threads=num_threads,
+        batch_size=batch_size,
+        pool_size=pool_size,
         bw_gbps=bw,
         avg_lat_us=avg_lat,
         avg_tx_us=avg_tx,
@@ -748,39 +755,50 @@ def run_all(
     numa_node: int,
 ) -> List[BenchResult]:
     results: List[BenchResult] = []
-    total = len(OPERATIONS) * len(BLOCK_SIZES_KB) * len(THREAD_COUNTS)
+    total = (
+        len(OPERATIONS)
+        * len(BLOCK_SIZES_KB)
+        * len(BATCH_SIZES)
+        * len(POOL_SIZES)
+        * len(THREAD_COUNTS)
+    )
     done = 0
 
     for op in OPERATIONS:
         for bs_kb in BLOCK_SIZES_KB:
             bs_b = bs_kb * 1024
-            for nt in THREAD_COUNTS:
-                done += 1
-                print(
-                    f"  [{done:2d}/{total}] {op:5s} {bs_kb:4d} KB  {nt:2d}T ... ",
-                    end="",
-                    flush=True,
-                    file=sys.stderr,
-                )
-                r = _run_one(
-                    nixlbench,
-                    op,
-                    bs_b,
-                    nt,
-                    env,
-                    warmup_iter,
-                    num_iter,
-                    total_buffer_size,
-                    numa_node,
-                )
-                if r:
-                    results.append(r)
-                    print(
-                        f"{r.bw_gbps:.3f} GB/s  avg {r.avg_tx_us:.0f} µs",
-                        file=sys.stderr,
-                    )
-                else:
-                    print("SKIPPED", file=sys.stderr)
+            for batch in BATCH_SIZES:
+                for pool in POOL_SIZES:
+                    for nt in THREAD_COUNTS:
+                        done += 1
+                        print(
+                            f"  [{done:3d}/{total}] {op:5s} {bs_kb:4d} KB"
+                            f"  bs={batch:2d}  pool={pool:2d}  {nt:2d}T ... ",
+                            end="",
+                            flush=True,
+                            file=sys.stderr,
+                        )
+                        r = _run_one(
+                            nixlbench,
+                            op,
+                            bs_b,
+                            nt,
+                            batch,
+                            pool,
+                            env,
+                            warmup_iter,
+                            num_iter,
+                            total_buffer_size,
+                            numa_node,
+                        )
+                        if r:
+                            results.append(r)
+                            print(
+                                f"{r.bw_gbps:.3f} GB/s  avg {r.avg_tx_us:.0f} µs",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print("SKIPPED", file=sys.stderr)
 
     return results
 
@@ -789,38 +807,45 @@ def run_all(
 # Report rendering
 # ---------------------------------------------------------------------------
 
-_Index = Dict[Tuple[str, int, int], BenchResult]
+_Index = Dict[Tuple[str, int, int, int, int], BenchResult]
 
 
-def _bw(r: Optional[BenchResult]) -> str:
-    return f"{r.bw_gbps:.3f}" if r else "—"
+def _fmt(r: Optional[BenchResult], attr: str, fmt: str = ".3f") -> str:
+    return format(getattr(r, attr), fmt) if r else "—"
 
 
-def _lat(r: Optional[BenchResult], attr: str) -> str:
-    return f"{getattr(r, attr):.0f}" if r else "—"
-
-
-def _bw_table(op: str, idx: _Index) -> str:
-    hdr = "| Block Size |" + "".join(f" {t}T (GB/s) |" for t in THREAD_COUNTS)
-    sep = "|:----------:|" + "|:---------:|" * len(THREAD_COUNTS)
+def _results_table(op: str, idx: _Index) -> str:
+    hdr = (
+        "| Block (KB) | Batch | Pool | Threads"
+        " | BW (GB/s)"
+        " | Avg Lat (µs) | Avg Tx (µs) | P99 Tx (µs)"
+        " | Avg Prep (µs) | P99 Prep (µs)"
+        " | Avg Post (µs) | P99 Post (µs) |"
+    )
+    sep = (
+        "|:----------:|:-----:|:----:|:-------:"
+        "|:----------:"
+        "|:------------:|:-----------:|:-----------:"
+        "|:-------------:|:-------------:"
+        "|:-------------:|:-------------:|"
+    )
     rows = [hdr, sep]
     for bs_kb in BLOCK_SIZES_KB:
-        cells = [f"{bs_kb} KB"] + [
-            _bw(idx.get((op, bs_kb * 1024, t))) for t in THREAD_COUNTS
-        ]
-        rows.append("| " + " | ".join(cells) + " |")
-    return "\n".join(rows)
-
-
-def _lat_table(op: str, idx: _Index, attr: str, label: str) -> str:
-    hdr = "| Block Size |" + "".join(f" {t}T {label} |" for t in THREAD_COUNTS)
-    sep = "|:----------:|" + "|:-----------:|" * len(THREAD_COUNTS)
-    rows = [hdr, sep]
-    for bs_kb in BLOCK_SIZES_KB:
-        cells = [f"{bs_kb} KB"] + [
-            _lat(idx.get((op, bs_kb * 1024, t)), attr) for t in THREAD_COUNTS
-        ]
-        rows.append("| " + " | ".join(cells) + " |")
+        for batch in BATCH_SIZES:
+            for pool in POOL_SIZES:
+                for nt in THREAD_COUNTS:
+                    r = idx.get((op, bs_kb * 1024, nt, batch, pool))
+                    rows.append(
+                        f"| {bs_kb} | {batch} | {pool} | {nt}"
+                        f" | {_fmt(r, 'bw_gbps')}"
+                        f" | {_fmt(r, 'avg_lat_us', '.0f')}"
+                        f" | {_fmt(r, 'avg_tx_us', '.0f')}"
+                        f" | {_fmt(r, 'p99_tx_us', '.0f')}"
+                        f" | {_fmt(r, 'avg_prep_us', '.0f')}"
+                        f" | {_fmt(r, 'p99_prep_us', '.0f')}"
+                        f" | {_fmt(r, 'avg_post_us', '.0f')}"
+                        f" | {_fmt(r, 'p99_post_us', '.0f')} |"
+                    )
     return "\n".join(rows)
 
 
@@ -848,7 +873,10 @@ def render_report(
     timestamp: str,
     numa_node: int,
 ) -> str:
-    idx: _Index = {(r.op, r.block_size_b, r.num_threads): r for r in results}
+    idx: _Index = {
+        (r.op, r.block_size_b, r.num_threads, r.batch_size, r.pool_size): r
+        for r in results
+    }
     L: List[str] = []
 
     if numa_node >= 0:
@@ -869,7 +897,7 @@ def render_report(
 
     redis_cfg = (
         f"`{args.redis_host}:{args.redis_port}`"
-        f"  pool\\_size={args.redis_pool_size}"
+        f"  pool\\_size=swept {POOL_SIZES}"
         f"  io\\_threads={args.redis_io_threads}"
         f"  network=host"
     )
@@ -958,29 +986,16 @@ def render_report(
     L += [
         "## Benchmark Results",
         "",
-        "Columns are thread counts (`--num_threads`). Batch size = 1, pipeline depth = 1.",
+        "Sweep: block size × batch size × pool size × thread count. Pipeline depth = 1.",
+        "Latency columns: Avg/P99 Tx = transfer time, Avg/P99 Prep = prepare time,",
+        "Avg/P99 Post = post time, Avg Lat = mean end-to-end latency.",
         "",
     ]
-
     for op in OPERATIONS:
         L += [
             f"### {op}",
             "",
-            "#### Bandwidth (GB/s)",
-            "",
-            _bw_table(op, idx),
-            "",
-            "#### Avg Transfer Latency — Avg Tx (µs)",
-            "",
-            _lat_table(op, idx, "avg_tx_us", "Avg Tx (µs)"),
-            "",
-            "#### P99 Transfer Latency — P99 Tx (µs)",
-            "",
-            _lat_table(op, idx, "p99_tx_us", "P99 Tx (µs)"),
-            "",
-            "#### Avg End-to-End Latency — Avg Lat (µs)",
-            "",
-            _lat_table(op, idx, "avg_lat_us", "Avg Lat (µs)"),
+            _results_table(op, idx),
             "",
         ]
 
@@ -988,10 +1003,12 @@ def render_report(
     L += [
         "## Summary: Peak Bandwidth",
         "",
-        "Best observed bandwidth per operation across all block sizes and thread counts.",
+        "Best observed bandwidth per operation across all sweep combinations.",
         "",
-        "| Operation | Block Size | Threads | B/W (GB/s) | Avg Tx (µs) | P99 Tx (µs) |",
-        "|:----------|:----------:|:-------:|:----------:|:-----------:|:-----------:|",
+        "| Operation | Block (KB) | Batch | Pool | Threads"
+        " | BW (GB/s) | Avg Tx (µs) | P99 Tx (µs) |",
+        "|:----------|:----------:|:-----:|:----:|:-------:"
+        "|:----------:|:-----------:|:-----------:|",
     ]
     for op in OPERATIONS:
         best = max(
@@ -999,7 +1016,8 @@ def render_report(
         )
         if best:
             L.append(
-                f"| {op} | {best.block_size_b // 1024} KB | {best.num_threads}T"
+                f"| {op} | {best.block_size_b // 1024} | {best.batch_size}"
+                f" | {best.pool_size} | {best.num_threads}"
                 f" | {best.bw_gbps:.3f} | {best.avg_tx_us:.0f} | {best.p99_tx_us:.0f} |"
             )
 
@@ -1079,7 +1097,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--redis-host", default="127.0.0.1")
     p.add_argument("--redis-port", type=int, default=6379)
-    p.add_argument("--redis-pool-size", type=int, default=8)
     p.add_argument(
         "--numa-node",
         type=int,
@@ -1189,16 +1206,22 @@ def main() -> None:
         info = collect_server_info()
 
         # Build runtime environment
-        env = _bench_env(
-            args.redis_host, args.redis_port, args.redis_pool_size, nixl_install_dir
-        )
+        env = _bench_env(args.redis_host, args.redis_port, nixl_install_dir)
 
         # Benchmark phase
-        total_runs = len(OPERATIONS) * len(BLOCK_SIZES_KB) * len(THREAD_COUNTS)
+        total_runs = (
+            len(OPERATIONS)
+            * len(BLOCK_SIZES_KB)
+            * len(BATCH_SIZES)
+            * len(POOL_SIZES)
+            * len(THREAD_COUNTS)
+        )
         print(f"\n{'=' * 60}", file=sys.stderr)
         print(
             f"Benchmark phase  ({total_runs} runs: "
-            f"{len(OPERATIONS)} ops × {len(BLOCK_SIZES_KB)} block sizes × {len(THREAD_COUNTS)} threads)",
+            f"{len(OPERATIONS)} ops × {len(BLOCK_SIZES_KB)} block sizes"
+            f" × {len(BATCH_SIZES)} batch sizes"
+            f" × {len(POOL_SIZES)} pool sizes × {len(THREAD_COUNTS)} threads)",
             file=sys.stderr,
         )
         print(f"{'=' * 60}\n", file=sys.stderr)
