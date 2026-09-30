@@ -555,16 +555,36 @@ RedisConnectionPool::getCallback(redisAsyncContext *c, void *reply, void *privda
             auto promise = ctx->promise_ptr;
             auto *inFlight = ctx->inFlight;
             delete ctx;
-            slot->pool->postToWorker([str, dst, len, promise, inFlight]() {
-                std::memcpy(reinterpret_cast<void *>(dst), str, len);
-                hi_free(str);
+
+            // For small payloads the worker-dispatch overhead (mutex + futex per callback)
+            // exceeds the memcpy cost, so copy inline on the event loop thread.
+            // 512 KB at ~20 GB/s ≈ 25 µs — acceptable blocking time for one callback.
+            static constexpr size_t kInlineThreshold = 512 * 1024;
+            if (len <= kInlineThreshold) {
+                std::memcpy(reinterpret_cast<void *>(dst), r->str, len);
                 if (inFlight) {
                     inFlight->fetch_sub(1, std::memory_order_relaxed);
                 }
                 if (promise) {
                     promise->set_value(NIXL_SUCCESS);
                 }
-            });
+            } else {
+                // Steal the reply buffer so the large memcpy runs on a worker thread
+                // without blocking the event loop. hiredis skips free() for null str.
+                auto *slot = static_cast<Slot *>(c->data);
+                char *str = r->str;
+                r->str = nullptr;
+                slot->pool->postToWorker([str, dst, len, promise, inFlight]() {
+                    std::memcpy(reinterpret_cast<void *>(dst), str, len);
+                    hi_free(str);
+                    if (inFlight) {
+                        inFlight->fetch_sub(1, std::memory_order_relaxed);
+                    }
+                    if (promise) {
+                        promise->set_value(NIXL_SUCCESS);
+                    }
+                });
+            }
             return;
         }
 
