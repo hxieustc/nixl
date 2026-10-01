@@ -473,8 +473,8 @@ RedisConnectionPool::connectCallback(const redisAsyncContext *c, int status) {
         // hiredis frees c after this callback returns (REDIS_CONNECTED was never set,
         // so disconnectCallback is NOT called). Null asyncCtx now so stopEventLoop
         // does not call redisAsyncFree on already-freed memory.
-        slot->asyncCtx = nullptr;
-        slot->pool->completeSlotInit(*slot, false);
+        sc->asyncCtx = nullptr;
+        sc->slot->pool->completeSubConnInit(*sc, false);
     } else {
         sc->slot->pool->startSubConnAuth(*sc);
     }
@@ -488,8 +488,8 @@ RedisConnectionPool::disconnectCallback(const redisAsyncContext *c, int status) 
     }
     // hiredis frees c after this callback returns. Null asyncCtx now so stopEventLoop
     // does not call redisAsyncFree on already-freed memory (double-free).
-    slot->asyncCtx = nullptr;
-    slot->connected.store(false);
+    sc->asyncCtx = nullptr;
+    sc->connected.store(false);
 }
 
 void
@@ -497,14 +497,14 @@ RedisConnectionPool::authCallback(redisAsyncContext *c, void *reply, void *privd
     auto *sc = static_cast<SubConn *>(privdata);
     auto *r = static_cast<redisReply *>(reply);
     if (!checkRedisReplyOk(r, "AUTH")) {
-        slot->pool->completeSlotInit(*slot, false);
+        sc->slot->pool->completeSubConnInit(*sc, false);
         if (r == nullptr) {
             // Connection dropped: hiredis fires disconnectCallback and frees c itself.
             // Null asyncCtx now so disconnectCallback and stopEventLoop don't double-free.
-            slot->asyncCtx = nullptr;
+            sc->asyncCtx = nullptr;
         } else {
             // Server rejected AUTH while connection is still live; close it explicitly.
-            slot->pool->freeSlotAsyncCtx(*slot);
+            sc->slot->pool->freeSubConnAsyncCtx(*sc);
         }
         return;
     }
@@ -516,11 +516,11 @@ RedisConnectionPool::selectCallback(redisAsyncContext *c, void *reply, void *pri
     auto *sc = static_cast<SubConn *>(privdata);
     auto *r = static_cast<redisReply *>(reply);
     if (!checkRedisReplyOk(r, "SELECT")) {
-        slot->pool->completeSlotInit(*slot, false);
+        sc->slot->pool->completeSubConnInit(*sc, false);
         if (r == nullptr) {
-            slot->asyncCtx = nullptr;
+            sc->asyncCtx = nullptr;
         } else {
-            slot->pool->freeSlotAsyncCtx(*slot);
+            sc->slot->pool->freeSubConnAsyncCtx(*sc);
         }
         return;
     }
@@ -562,12 +562,6 @@ RedisConnectionPool::getCallback(redisAsyncContext *c, void *reply, void *privda
         const bool size_ok = (reply_len == ctx->data_len);
 
         if (size_ok && ctx->data_len > 0 && ctx->data_ptr) {
-            // Steal ownership of the reply buffer so the memcpy runs on a worker thread
-            // instead of blocking the shared event loop. hiredis skips hi_free() when
-            // reply->str is null; the worker uses hi_free() to match the hiredis allocator.
-            auto *slot = static_cast<Slot *>(c->data);
-            char *str = r->str;
-            r->str = nullptr;
             uintptr_t dst = ctx->data_ptr;
             size_t len = ctx->data_len;
             auto promise = ctx->promise_ptr;
@@ -588,7 +582,8 @@ RedisConnectionPool::getCallback(redisAsyncContext *c, void *reply, void *privda
                 }
             } else {
                 // Steal the reply buffer so the large memcpy runs on a worker thread
-                // without blocking the event loop. hiredis skips free() for null str.
+                // without blocking the event loop. hiredis skips hi_free() for null str;
+                // the worker uses hi_free() to match the hiredis allocator.
                 auto *sc = static_cast<SubConn *>(c->data);
                 char *str = r->str;
                 r->str = nullptr;
